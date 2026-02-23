@@ -324,13 +324,23 @@ struct LibraryView: View {
 
     private func batchShare() async {
         isPerformingBatchAction = true
-        var urls: [URL] = []
-        var names: [String] = []
-        var isVideoFlags: [Bool] = []
+        let ids = Array(selectedAssetIds)
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
 
-        for id in selectedAssetIds {
+        await MainActor.run {
+            shareManager.fileURLs = []
+            shareManager.fileNames = []
+            shareManager.fileIsVideo = []
+            shareManager.isLoadingFiles = true
+            shareManager.showShareSheet = true
+        }
+
+        var urls: [URL] = []
+        var names: [String] = []
+        var isVideoFlags: [Bool] = []
+
+        for id in ids {
             guard let asset = loadedAssets.first(where: { $0.id == id }),
                   let url = api.getOriginalImageURL(assetId: id) else { continue }
             do {
@@ -349,7 +359,7 @@ struct LibraryView: View {
             shareManager.fileURLs = urls
             shareManager.fileNames = names
             shareManager.fileIsVideo = isVideoFlags
-            shareManager.showShareSheet = true
+            shareManager.isLoadingFiles = false
             isPerformingBatchAction = false
         }
     }
@@ -517,7 +527,8 @@ struct LibraryView: View {
         guard let url = api.getOriginalImageURL(assetId: asset.id) else { return }
         do {
             let data = try await api.loadImageData(from: url)
-            let tempDir = FileManager.default.temporaryDirectory
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
             let tempURL = tempDir.appendingPathComponent(asset.originalFileName)
             try data.write(to: tempURL)
 
@@ -525,6 +536,7 @@ struct LibraryView: View {
             let imageForSharing: UIImage? = isVideo ? nil : UIImage(data: data)
 
             await MainActor.run {
+                shareManager.singleFileTempDir = tempDir
                 shareManager.fileURL = tempURL
                 shareManager.fileName = asset.originalFileName
                 shareManager.isVideo = isVideo

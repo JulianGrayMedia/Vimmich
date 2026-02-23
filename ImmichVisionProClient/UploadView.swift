@@ -169,14 +169,10 @@ struct UploadView: View {
                                     if let thumbnail = media.thumbnail {
                                         Image(uiImage: thumbnail)
                                             .resizable()
-                                            .aspectRatio(1, contentMode: .fill)
-                                            .clipped()
-                                            .cornerRadius(8)
+                                            .scaledToFill()
                                     } else {
                                         Rectangle()
                                             .fill(Color.gray.opacity(0.3))
-                                            .aspectRatio(1, contentMode: .fill)
-                                            .cornerRadius(8)
                                             .overlay {
                                                 ProgressView()
                                                     .scaleEffect(0.7)
@@ -186,14 +182,12 @@ struct UploadView: View {
                                     // Status overlay
                                     if media.isUploading {
                                         Color.black.opacity(0.5)
-                                            .cornerRadius(8)
                                             .overlay {
                                                 ProgressView()
                                                     .tint(.white)
                                             }
                                     } else if media.isUploaded {
                                         Color.black.opacity(0.5)
-                                            .cornerRadius(8)
                                             .overlay {
                                                 Image(systemName: "checkmark")
                                                     .font(.title2)
@@ -201,7 +195,6 @@ struct UploadView: View {
                                             }
                                     } else if media.isDuplicate {
                                         Color.black.opacity(0.5)
-                                            .cornerRadius(8)
                                             .overlay {
                                                 Image(systemName: "doc.on.doc")
                                                     .font(.title3)
@@ -209,7 +202,6 @@ struct UploadView: View {
                                             }
                                     } else if media.isFailed {
                                         Color.black.opacity(0.5)
-                                            .cornerRadius(8)
                                             .overlay {
                                                 Image(systemName: "xmark")
                                                     .font(.title2)
@@ -217,6 +209,9 @@ struct UploadView: View {
                                             }
                                     }
                                 }
+                                .aspectRatio(1, contentMode: .fit)
+                                .clipped()
+                                .cornerRadius(8)
                             }
                         }
                     }
@@ -235,15 +230,15 @@ struct UploadView: View {
                         HStack(spacing: 24) {
                             if uploadedCount > 0 {
                                 Label("\(uploadedCount) uploaded", systemImage: "checkmark.circle.fill")
-                                    .foregroundStyle(.green)
+                                    .foregroundStyle(.primary)
                             }
                             if duplicateCount > 0 {
                                 Label("\(duplicateCount) duplicates", systemImage: "doc.on.doc.fill")
-                                    .foregroundStyle(.orange)
+                                    .foregroundStyle(.secondary)
                             }
                             if failedCount > 0 {
                                 Label("\(failedCount) failed", systemImage: "xmark.circle.fill")
-                                    .foregroundStyle(.red)
+                                    .foregroundStyle(.secondary)
                             }
                         }
                         .font(.subheadline)

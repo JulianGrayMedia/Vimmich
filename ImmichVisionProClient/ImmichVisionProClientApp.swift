@@ -21,9 +21,15 @@ class ShareManager: ObservableObject {
     @Published var fileNames: [String] = []
     @Published var fileIsVideo: [Bool] = []
     @Published var isSelectionModeActive: Bool = false
+    @Published var isLoadingFiles: Bool = false
+    // UUID subdirectory used for single-file share temp file (prevents collision with spatial viewer cache)
+    var singleFileTempDir: URL?
 
     func clear() {
-        if let url = fileURL {
+        // Remove single-file share temp directory (UUID subdirectory)
+        if let dir = singleFileTempDir {
+            try? FileManager.default.removeItem(at: dir)
+        } else if let url = fileURL {
             try? FileManager.default.removeItem(at: url)
         }
         // Remove batch share temp directory (files are in a UUID-named subdirectory)
@@ -31,6 +37,7 @@ class ShareManager: ObservableObject {
             let parentDir = firstURL.deletingLastPathComponent()
             try? FileManager.default.removeItem(at: parentDir)
         }
+        singleFileTempDir = nil
         fileURL = nil
         fileName = ""
         showShareSheet = false
@@ -40,6 +47,7 @@ class ShareManager: ObservableObject {
         fileURLs = []
         fileNames = []
         fileIsVideo = []
+        isLoadingFiles = false
     }
 }
 

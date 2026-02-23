@@ -57,6 +57,7 @@ struct ContentView: View {
     @State private var displayedTab: PhotoTab = .collection  // Which tab content is shown
     @State private var contentScale: CGFloat = 1.0  // Only used for outgoing animation
     @State private var contentOpacity: Double = 1.0
+    @Environment(\.scenePhase) private var scenePhase
 
     // Login form state
     @State private var serverURL = ""
@@ -118,10 +119,11 @@ struct ContentView: View {
                     Text("Server URL")
                         .font(.headline)
                         .foregroundStyle(.white.opacity(0.6))
-                    TextField("http://192.168.1.100:2283", text: $serverURL)
+                    TextField("Server address", text: $serverURL)
                         .textFieldStyle(.roundedBorder)
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
+                        .tint(.white)
                         .focused($focusedField, equals: .serverURL)
                         .onSubmit { focusedField = .email }
                 }
@@ -135,6 +137,7 @@ struct ContentView: View {
                         .textContentType(.emailAddress)
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
+                        .tint(.white)
                         .focused($focusedField, equals: .email)
                         .onSubmit { focusedField = .password }
                 }
@@ -146,6 +149,7 @@ struct ContentView: View {
                     SecureField("Password", text: $password)
                         .textFieldStyle(.roundedBorder)
                         .textContentType(.password)
+                        .tint(.white)
                         .focused($focusedField, equals: .password)
                         .onSubmit { Task { await performLogin() } }
                 }
@@ -170,13 +174,12 @@ struct ContentView: View {
                     }
                     .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.bordered)
                 .disabled(serverURL.isEmpty || email.isEmpty || password.isEmpty || isLoggingIn)
             }
             .frame(width: 360)
             .padding(28)
             .glassBackgroundEffect(in: RoundedRectangle(cornerRadius: 20))
-            .tint(.white)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(60)
@@ -396,6 +399,11 @@ struct ContentView: View {
             .animation(.easeInOut(duration: 0.2).delay(0.15), value: spatialPhotoManager.isDisplaying)
             .animation(.easeInOut(duration: 0.2).delay(0.15), value: spatialPhotoManager.isRestoringScrollPosition)
             .animation(nil, value: shareManager.isSelectionModeActive)
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .background {
+                navigationPath = NavigationPath()
+            }
         }
     }
 
@@ -843,11 +851,21 @@ struct LockedFolderView: View {
     private func batchShare() async {
         isPerformingBatchAction = true
         let ids = Array(selectedAssetIds)
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+
+        // Show the sheet immediately with a loading indicator
+        await MainActor.run {
+            shareManager.fileURLs = []
+            shareManager.fileNames = []
+            shareManager.fileIsVideo = []
+            shareManager.isLoadingFiles = true
+            shareManager.showShareSheet = true
+        }
+
         var urls: [URL] = []
         var names: [String] = []
         var isVideoFlags: [Bool] = []
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
 
         for id in ids {
             guard let asset = lockedAssets.first(where: { $0.id == id }),
@@ -868,7 +886,7 @@ struct LockedFolderView: View {
             shareManager.fileURLs = urls
             shareManager.fileNames = names
             shareManager.fileIsVideo = isVideoFlags
-            shareManager.showShareSheet = true
+            shareManager.isLoadingFiles = false
             isPerformingBatchAction = false
         }
     }
@@ -975,7 +993,8 @@ struct LockedFolderView: View {
         guard let url = api.getOriginalImageURL(assetId: asset.id) else { return }
         do {
             let data = try await api.loadImageData(from: url)
-            let tempDir = FileManager.default.temporaryDirectory
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
             let tempURL = tempDir.appendingPathComponent(asset.originalFileName)
             try data.write(to: tempURL)
 
@@ -983,6 +1002,7 @@ struct LockedFolderView: View {
             let imageForSharing: UIImage? = isVideo ? nil : UIImage(data: data)
 
             await MainActor.run {
+                shareManager.singleFileTempDir = tempDir
                 shareManager.fileURL = tempURL
                 shareManager.fileName = asset.originalFileName
                 shareManager.isVideo = isVideo
@@ -1011,7 +1031,9 @@ struct ShareSheetView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 20) {
-                if isMultiFile {
+                if shareManager.isLoadingFiles {
+                    loadingContent
+                } else if isMultiFile {
                     multiFileContent
                 } else if let url = shareManager.fileURL {
                     singleFileContent(url: url)
@@ -1032,6 +1054,17 @@ struct ShareSheetView: View {
                 }
             }
         }
+    }
+
+    private var loadingContent: some View {
+        VStack(spacing: 16) {
+            ProgressView()
+                .scaleEffect(1.5)
+            Text("Preparing files...")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 200)
     }
 
     private var multiFileContent: some View {
@@ -1221,6 +1254,7 @@ struct ShareSheetView: View {
 
     private func saveAllToPhotos() {
         let urls = shareManager.fileURLs
+        let isVideoFlags = shareManager.fileIsVideo
         guard !urls.isEmpty else {
             saveError = "No files to save"
             return
@@ -1230,65 +1264,54 @@ struct ShareSheetView: View {
         saveError = nil
 
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
-            DispatchQueue.main.async {
-                switch status {
-                case .authorized, .limited:
-                    let total = urls.count
-                    var savedCount = 0
-                    var failedCount = 0
-                    let group = DispatchGroup()
+            guard status == .authorized || status == .limited else {
+                DispatchQueue.main.async {
+                    self.isSaving = false
+                    self.saveError = "Photo library access denied. Enable in Settings."
+                }
+                return
+            }
 
-                    for (index, url) in urls.enumerated() {
-                        guard FileManager.default.fileExists(atPath: url.path) else {
-                            failedCount += 1
-                            continue
-                        }
+            let group = DispatchGroup()
+            var savedCount = 0
+            var failedCount = 0
 
-                        let isVideo = index < shareManager.fileIsVideo.count && shareManager.fileIsVideo[index]
+            for (index, url) in urls.enumerated() {
+                guard FileManager.default.fileExists(atPath: url.path) else {
+                    failedCount += 1
+                    continue
+                }
 
-                        group.enter()
-                        PHPhotoLibrary.shared().performChanges {
-                            if isVideo {
-                                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
-                            } else {
-                                if let data = try? Data(contentsOf: url),
-                                   let image = UIImage(data: data) {
-                                    PHAssetChangeRequest.creationRequestForAsset(from: image)
-                                } else {
-                                    PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: url)
-                                }
-                            }
-                        } completionHandler: { success, _ in
-                            if success {
-                                savedCount += 1
-                            } else {
-                                failedCount += 1
-                            }
-                            group.leave()
-                        }
+                let isVideo = index < isVideoFlags.count && isVideoFlags[index]
+
+                group.enter()
+                PHPhotoLibrary.shared().performChanges({
+                    if isVideo {
+                        PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+                    } else {
+                        PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: url)
                     }
-
-                    group.notify(queue: .main) {
-                        isSaving = false
-                        if failedCount == 0 {
-                            saveSuccess = true
-                            saveError = nil
-                        } else if savedCount > 0 {
-                            saveSuccess = true
-                            saveError = "Saved \(savedCount) of \(total) items (\(failedCount) failed)"
-                        } else {
-                            saveError = "Failed to save items to Photos"
-                        }
+                }, completionHandler: { success, error in
+                    if success {
+                        savedCount += 1
+                    } else {
+                        print("❌ Failed to save \(url.lastPathComponent): \(error?.localizedDescription ?? "unknown")")
+                        failedCount += 1
                     }
-                case .denied, .restricted:
-                    isSaving = false
-                    saveError = "Photo library access denied. Enable in Settings."
-                case .notDetermined:
-                    isSaving = false
-                    saveError = "Permission not determined"
-                @unknown default:
-                    isSaving = false
-                    saveError = "Unknown permission status"
+                    group.leave()
+                })
+            }
+
+            group.notify(queue: .main) {
+                self.isSaving = false
+                if failedCount == 0 {
+                    self.saveSuccess = true
+                    self.saveError = nil
+                } else if savedCount > 0 {
+                    self.saveSuccess = true
+                    self.saveError = "Saved \(savedCount) of \(urls.count) (\(failedCount) failed)"
+                } else {
+                    self.saveError = "Failed to save items to Photos"
                 }
             }
         }

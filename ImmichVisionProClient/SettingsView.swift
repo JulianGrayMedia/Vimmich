@@ -64,6 +64,7 @@ struct SettingsView: View {
                 .alert("Sign Out?", isPresented: $showLogoutConfirmation) {
                     Button("Cancel", role: .cancel) { }
                     Button("Sign Out", role: .destructive) {
+                        spatialCache.clearCache()
                         api.logout()
                     }
                 } message: {
@@ -173,37 +174,30 @@ struct SettingsView: View {
                                     .foregroundStyle(.secondary)
 
                                 ForEach(Array(spatialPhotoManager.activeDownloads.values)) { download in
-                                    HStack(spacing: 12) {
-                                        // Thumbnail
+                                    VStack(spacing: 8) {
+                                        // Thumbnail centered
                                         DownloadThumbnailView(assetId: download.id)
-                                            .frame(width: 44, height: 44)
-                                            .cornerRadius(6)
+                                            .frame(width: 60, height: 60)
+                                            .cornerRadius(8)
 
-                                        // Progress info
-                                        VStack(alignment: .leading, spacing: 4) {
-                                            HStack {
-                                                if download.totalBytes > 0 {
-                                                    Text("\(formatBytes(download.downloadedBytes)) / \(formatBytes(download.totalBytes))")
-                                                        .font(.caption)
-                                                        .foregroundStyle(.primary)
-                                                } else {
-                                                    Text("Starting...")
-                                                        .font(.caption)
-                                                        .foregroundStyle(.secondary)
-                                                }
-                                                Spacer()
-                                                if download.totalBytes > 0 {
-                                                    Text("\(Int(download.progress * 100))%")
-                                                        .font(.caption)
-                                                        .foregroundStyle(.secondary)
-                                                }
-                                            }
-                                            ProgressView(value: download.progress)
-                                                .progressViewStyle(.linear)
-                                                .tint(.blue)
-                                                .frame(maxWidth: 260)
+                                        // Progress bar centered
+                                        ProgressView(value: download.progress)
+                                            .progressViewStyle(.linear)
+                                            .tint(.blue)
+                                            .frame(width: 220)
+
+                                        // Bytes and percentage centered
+                                        if download.totalBytes > 0 {
+                                            Text("\(Int(download.progress * 100))%  ·  \(formatBytes(download.downloadedBytes)) / \(formatBytes(download.totalBytes))")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        } else {
+                                            Text("Starting...")
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
                                         }
                                     }
+                                    .frame(maxWidth: .infinity)
                                 }
                             }
                             .padding(.vertical, 4)

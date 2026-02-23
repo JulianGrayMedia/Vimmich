@@ -878,6 +878,43 @@ class ImmichAPI: ObservableObject {
         print("🗑️ Deleted album: \(albumId.prefix(8))...")
     }
 
+    /// Create a new album, optionally seeding it with asset IDs
+    @discardableResult
+    func createAlbum(name: String, assetIds: [String] = []) async throws -> Album {
+        guard let url = URL(string: "\(baseURL)/api/albums") else {
+            throw URLError(.badURL)
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        var body: [String: Any] = ["albumName": name]
+        if !assetIds.isEmpty {
+            body["assetIds"] = assetIds
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 201 else {
+            print("❌ Create album failed with status: \((response as? HTTPURLResponse)?.statusCode ?? -1)")
+            throw URLError(.badServerResponse)
+        }
+
+        let decoder = JSONDecoder()
+        let newAlbum = try decoder.decode(Album.self, from: data)
+
+        // Prepend to local list so it shows up at the top
+        albums.insert(newAlbum, at: 0)
+
+        print("➕ Created album \"\(name)\" with id: \(newAlbum.id.prefix(8))...")
+        return newAlbum
+    }
+
     /// Update asset visibility (e.g., move to locked folder)
     func updateAssetVisibility(assetIds: [String], visibility: String) async throws {
         guard let url = URL(string: "\(baseURL)/api/assets") else {

@@ -713,15 +713,13 @@ struct SpatialPhotoImmersiveView: View {
         let player = AVPlayer(playerItem: playerItem)
         player.automaticallyWaitsToMinimizeStalling = false  // Don't wait, start immediately
 
-        // Detect spatial video from actual tracks (more reliable than metadata)
-        let isSpatialVideo = await detectSpatialVideo(asset: asset)
-        print("📼 Incoming video: detected spatial=\(isSpatialVideo) for \(assetId.prefix(8))")
+        // Always request .spatial mode — RealityKit ignores it for non-spatial content.
+        // Ensures spatial videos in the carousel display correctly without detection delay.
+        print("📼 Incoming video (spatial cache: \(spatialPhotoManager.isAssetKnownSpatial(assetId))) for \(assetId.prefix(8))")
 
         // Create video entity (add to incomingContentEntity like photos, so it inherits all animations)
         var videoComponent = VideoPlayerComponent(avPlayer: player)
-        if isSpatialVideo {
-            videoComponent.desiredSpatialVideoMode = .spatial
-        }
+        videoComponent.desiredSpatialVideoMode = .spatial  // Always: RealityKit renders mono for non-spatial
         videoComponent.isPassthroughTintingEnabled = false
         let videoEntity = Entity()
         videoEntity.name = "incomingVideoEntity"
@@ -739,6 +737,7 @@ struct SpatialPhotoImmersiveView: View {
 
         // Start playback immediately - video will render first frame when ready
         player.play()
+
         print("📼 Incoming video entity added to incomingContentEntity")
     }
 
@@ -835,16 +834,19 @@ struct SpatialPhotoImmersiveView: View {
                 let player = AVPlayer(playerItem: playerItem)
                 player.automaticallyWaitsToMinimizeStalling = false
 
-                // Detect spatial video from actual tracks (more reliable than metadata)
-                let isSpatialVideo = await detectSpatialVideo(asset: avAsset)
-                print("📼 Pre-create: detected spatial=\(isSpatialVideo) for \(asset.id.prefix(8))")
+                // Check spatial cache. For uncached assets, always request .spatial mode —
+                // RealityKit ignores it for non-spatial content, so it's safe to always set.
+                // The entity is not in the scene yet so availableViewingModes can't be polled;
+                // when this entity becomes current via waitForPlayerAndPlay, detection runs there.
+                let isSpatialVideo = spatialPhotoManager.isAssetKnownSpatial(asset.id)
+                print("📼 Pre-create: spatial=\(isSpatialVideo) for \(asset.id.prefix(8))")
 
                 // Create video entity (but don't add to scene yet)
                 // Use opacity 0.2 from the start to avoid flicker when enabling
                 var videoComponent = VideoPlayerComponent(avPlayer: player)
-                if isSpatialVideo {
-                    videoComponent.desiredSpatialVideoMode = .spatial
-                }
+                // Always request spatial mode: RealityKit applies it only when content supports it.
+                // This ensures spatial assets render correctly even when not yet in the cache.
+                videoComponent.desiredSpatialVideoMode = .spatial
                 videoComponent.isPassthroughTintingEnabled = false
                 let videoEntity = Entity()
                 videoEntity.name = "preCreatedVideoEntity_\(asset.id.prefix(8))"
@@ -1412,19 +1414,20 @@ struct SpatialPhotoImmersiveView: View {
             return
         }
 
-        print("📼 streamVideo targetPosition: \(targetPosition)")
-
-        print("📼 Streaming video from original URL: \(originalURL.lastPathComponent)")
+        let assetId = spatialPhotoManager.currentAssetMetadata?.id
+        print("📼 streamVideo — assetId: \(assetId?.prefix(8) ?? "nil"), url: \(originalURL)")
 
         // Show loading indicator until video is ready to play
         showLoading = true
 
         // Check for pre-buffered data
-        let assetId = spatialPhotoManager.currentAssetMetadata?.id
         let preBufferInfo = assetId.flatMap { spatialPhotoManager.getPreBufferedVideoInfo(assetId: $0) }
         if let info = preBufferInfo {
-            print("📦 Found pre-buffered data for video (\(info.data.count / 1024)KB, contentLength: \(info.contentLength))")
+            print("📦 Pre-buffer found: \(info.data.count / 1024)KB, contentLength: \(info.contentLength), type: \(info.contentType ?? "nil")")
+        } else {
+            print("⚠️ No pre-buffer — readyToPlay will depend entirely on network speed")
         }
+        let streamStartTime = Date()
 
         // Create the streaming loader for authenticated access (with pre-buffered data if available)
         let loader = VideoStreamingLoader(
@@ -1473,8 +1476,11 @@ struct SpatialPhotoImmersiveView: View {
         // Store player reference
         videoPlayer = player
 
-        // Wait for player to be ready to play, detect spatial from actual video tracks
-        await waitForPlayerAndPlay(player: player, asset: asset, initialOpacity: initialOpacity, targetPosition: targetPosition)
+        // Wait for player to be ready to play
+        await waitForPlayerAndPlay(player: player, asset: asset,
+                                   originalURL: originalURL, accessToken: accessToken,
+                                   startTime: streamStartTime,
+                                   initialOpacity: initialOpacity, targetPosition: targetPosition)
     }
 
     /// Detect if video asset contains spatial video (MV-HEVC) tracks
@@ -1519,8 +1525,16 @@ struct SpatialPhotoImmersiveView: View {
         return false
     }
 
-    /// Wait for player to be ready, then show video
-    private func waitForPlayerAndPlay(player: AVPlayer, asset: AVAsset, initialOpacity: Float, targetPosition: SIMD3<Float>) async {
+    /// Wait for player to be ready, then show video.
+    /// - Parameters:
+    ///   - originalURL: The original HTTPS URL (not the custom scheme URL). Used for background
+    ///     spatial detection on uncached assets. Nil for offline/cached videos.
+    ///   - accessToken: Bearer token for background detection request. Nil for offline videos.
+    ///   - startTime: Optional timestamp from before AVPlayer creation, for elapsed-time logging.
+    private func waitForPlayerAndPlay(player: AVPlayer, asset: AVAsset,
+                                      originalURL: URL? = nil, accessToken: String? = nil,
+                                      startTime: Date? = nil,
+                                      initialOpacity: Float, targetPosition: SIMD3<Float>) async {
         // Observe player status
         var statusObserver: NSKeyValueObservation?
 
@@ -1532,7 +1546,8 @@ struct SpatialPhotoImmersiveView: View {
 
                 switch item.status {
                 case .readyToPlay:
-                    print("📼 Player ready to play")
+                    let elapsed = startTime.map { String(format: "%.2f", Date().timeIntervalSince($0)) + "s" } ?? "?"
+                    print("📼 Player readyToPlay after \(elapsed)")
                     hasResumed = true
                     continuation.resume(returning: true)
                 case .failed:
@@ -1550,7 +1565,7 @@ struct SpatialPhotoImmersiveView: View {
             Task {
                 try? await Task.sleep(for: .seconds(30))
                 if !hasResumed {
-                    print("⚠️ Player timeout")
+                    print("⚠️ Player timeout after 30s")
                     hasResumed = true
                     continuation.resume(returning: false)
                 }
@@ -1565,24 +1580,62 @@ struct SpatialPhotoImmersiveView: View {
             return
         }
 
-        // Detect spatial video from actual video tracks (more reliable than metadata)
-        let isSpatialVideo = await detectSpatialVideo(asset: asset)
-        print("📼 Spatial video detected: \(isSpatialVideo)")
-
-        // Mark as spatial in cache so it appears in Spatial Photos view
-        if isSpatialVideo {
+        // Spatial mode: always request .spatial — RealityKit renders it only if the content is
+        // actually MV-HEVC (ignores the request for regular mono video, rendering it as mono).
+        // This ensures spatial videos always display correctly on the very first open, even for
+        // assets not yet in the spatial cache, with zero risk to non-spatial videos.
+        let isKnownSpatial = spatialPhotoManager.isCurrentAssetKnownSpatial
+        if isKnownSpatial {
+            print("📼 Spatial video confirmed from spatial cache")
             spatialPhotoManager.markCurrentAssetAsSpatial()
         }
 
-        // Setup video entity and start playback at the target position
-        await setupVideoPlayer(player, initialOpacity: initialOpacity, isSpatialVideo: isSpatialVideo, targetPosition: targetPosition)
+        // Setup video entity — isSpatialVideo: true always requests spatial mode
+        await setupVideoPlayer(player, initialOpacity: initialOpacity, isSpatialVideo: true, targetPosition: targetPosition)
+
+        // For uncached assets: detect in a fully detached background task (no main actor,
+        // separate HTTPS AVURLAsset with no VideoStreamingLoader involvement) purely for
+        // cache population so the asset shows up in Spatial Photos. Never blocks playback.
+        if !isKnownSpatial, let url = originalURL, let token = accessToken {
+            let manager = spatialPhotoManager
+            Task.detached(priority: .background) {
+                let detectionAsset = AVURLAsset(
+                    url: url,
+                    options: ["AVURLAssetHTTPHeaderFieldsKey": ["Authorization": "Bearer \(token)"]])
+                var isSpatial = false
+                do {
+                    let videoTracks = try await detectionAsset.loadTracks(withMediaType: .video)
+                    outer: for track in videoTracks {
+                        let formatDescs = try await track.load(.formatDescriptions)
+                        for desc in formatDescs {
+                            if let exts = CMFormatDescriptionGetExtensions(desc) as? [String: Any],
+                               (exts["StereoMVHEVC"] != nil ||
+                                exts["HasLeftStereoEyeView"] != nil ||
+                                exts["HasRightStereoEyeView"] != nil) {
+                                isSpatial = true
+                                break outer
+                            }
+                        }
+                    }
+                } catch {
+                    print("⚠️ Background spatial detection error: \(error.localizedDescription)")
+                }
+                if isSpatial {
+                    await MainActor.run {
+                        manager.markCurrentAssetAsSpatial()
+                        print("📼 Background detection: spatial confirmed and cached")
+                    }
+                }
+            }
+        }
 
         // Wait for video to actually start rendering (currentTime > 0)
         // Keep loading indicator visible until video pixels are on screen
         for _ in 0..<100 {  // Check up to 100 times (5 seconds max)
             try? await Task.sleep(for: .milliseconds(50))
             if player.currentTime().seconds > 0.02 {
-                print("✅ Video playback confirmed at \(player.currentTime().seconds)s")
+                let elapsed = startTime.map { String(format: "%.2f", Date().timeIntervalSince($0)) + "s" } ?? "?"
+                print("✅ Video first frame visible after \(elapsed) (currentTime=\(String(format: "%.3f", player.currentTime().seconds))s)")
                 break
             }
         }
@@ -2002,12 +2055,10 @@ struct SpatialPhotoImmersiveView: View {
             let fileName = baseName.isEmpty ? UUID().uuidString : baseName
             let fullFileName = "\(fileName).\(fileExtension)"
 
-            // Create temp file with proper name and extension
-            let tempURL = FileManager.default.temporaryDirectory
-                .appendingPathComponent(fullFileName)
-
-            // Remove existing file if present
-            try? FileManager.default.removeItem(at: tempURL)
+            // Create temp file in UUID subdirectory to avoid collisions with spatial viewer cache
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            let tempURL = tempDir.appendingPathComponent(fullFileName)
 
             // Get the data to write - always download original quality for sharing
             var dataToWrite: Data
@@ -2066,6 +2117,7 @@ struct SpatialPhotoImmersiveView: View {
             }
 
             // Update share manager
+            shareManager.singleFileTempDir = tempDir
             shareManager.fileURL = tempURL
             shareManager.fileName = fullFileName
             shareManager.thumbnailData = thumbnailData

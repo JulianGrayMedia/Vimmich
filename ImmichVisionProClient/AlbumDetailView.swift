@@ -336,13 +336,23 @@ struct AlbumDetailView: View {
 
     private func batchShare() async {
         isPerformingBatchAction = true
-        var urls: [URL] = []
-        var names: [String] = []
-        var isVideoFlags: [Bool] = []
+        let ids = Array(selectedAssetIds)
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
 
-        for id in selectedAssetIds {
+        await MainActor.run {
+            shareManager.fileURLs = []
+            shareManager.fileNames = []
+            shareManager.fileIsVideo = []
+            shareManager.isLoadingFiles = true
+            shareManager.showShareSheet = true
+        }
+
+        var urls: [URL] = []
+        var names: [String] = []
+        var isVideoFlags: [Bool] = []
+
+        for id in ids {
             guard let asset = albumDetails?.assets.first(where: { $0.id == id }),
                   let url = api.getOriginalImageURL(assetId: id) else { continue }
             do {
@@ -357,11 +367,13 @@ struct AlbumDetailView: View {
             }
         }
 
-        shareManager.fileURLs = urls
-        shareManager.fileNames = names
-        shareManager.fileIsVideo = isVideoFlags
-        shareManager.showShareSheet = true
-        isPerformingBatchAction = false
+        await MainActor.run {
+            shareManager.fileURLs = urls
+            shareManager.fileNames = names
+            shareManager.fileIsVideo = isVideoFlags
+            shareManager.isLoadingFiles = false
+            isPerformingBatchAction = false
+        }
     }
 
     private func batchHide() async {
@@ -429,7 +441,8 @@ struct AlbumDetailView: View {
         guard let url = api.getOriginalImageURL(assetId: asset.id) else { return }
         do {
             let data = try await api.loadImageData(from: url)
-            let tempDir = FileManager.default.temporaryDirectory
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
             let tempURL = tempDir.appendingPathComponent(asset.originalFileName)
             try data.write(to: tempURL)
 
@@ -437,6 +450,7 @@ struct AlbumDetailView: View {
             let imageForSharing: UIImage? = isVideo ? nil : UIImage(data: data)
 
             await MainActor.run {
+                shareManager.singleFileTempDir = tempDir
                 shareManager.fileURL = tempURL
                 shareManager.fileName = asset.originalFileName
                 shareManager.isVideo = isVideo
@@ -601,60 +615,105 @@ struct AlbumPickerView: View {
     @Environment(\.dismiss) var dismiss
     @State private var isAdding = false
     @State private var addedToAlbum: String?
+    @State private var showNewAlbumField = false
+    @State private var newAlbumName = ""
+    @State private var isCreatingAlbum = false
 
     var body: some View {
         NavigationStack {
             ScrollView {
-                if api.albums.isEmpty {
-                    VStack(spacing: 20) {
-                        ProgressView("Loading albums...")
-                            .padding(.top, 100)
-                    }
-                } else {
-                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 16), count: 4), spacing: 16) {
-                        ForEach(api.albums.filter { $0.id != currentAlbumId }) { album in
-                            Button {
-                                Task {
-                                    await addToAlbum(album)
+                VStack(spacing: 16) {
+                    if showNewAlbumField {
+                        HStack(spacing: 12) {
+                            TextField("Album name", text: $newAlbumName)
+                                .textFieldStyle(.roundedBorder)
+                                .onSubmit {
+                                    Task { await createAndAddAlbum() }
                                 }
+                            Button {
+                                Task { await createAndAddAlbum() }
                             } label: {
-                                VStack(spacing: 8) {
-                                    if let thumbnailId = album.albumThumbnailAssetId {
-                                        AsyncThumbnailView(assetId: thumbnailId)
-                                            .aspectRatio(1, contentMode: .fill)
-                                            .frame(height: 120)
-                                            .clipped()
-                                            .cornerRadius(12)
-                                    } else {
-                                        RoundedRectangle(cornerRadius: 12)
-                                            .fill(Color.gray.opacity(0.3))
-                                            .frame(height: 120)
-                                            .overlay {
-                                                Image(systemName: "photo.on.rectangle")
-                                                    .font(.title)
-                                                    .foregroundStyle(.secondary)
-                                            }
-                                    }
-
-                                    Text(album.albumName)
-                                        .font(.caption)
-                                        .lineLimit(1)
-
-                                    if addedToAlbum == album.id {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .foregroundStyle(.white)
-                                    }
+                                if isCreatingAlbum {
+                                    ProgressView()
+                                        .frame(width: 60)
+                                } else {
+                                    Text("Create")
+                                        .frame(width: 60)
                                 }
                             }
+                            .buttonStyle(.bordered)
+                            .disabled(newAlbumName.trimmingCharacters(in: .whitespaces).isEmpty || isCreatingAlbum)
+                            Button {
+                                showNewAlbumField = false
+                                newAlbumName = ""
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.secondary)
+                            }
                             .buttonStyle(.plain)
-                            .disabled(isAdding)
                         }
+                        .padding(.horizontal)
                     }
-                    .padding()
+
+                    if api.albums.isEmpty && !showNewAlbumField {
+                        ProgressView("Loading albums...")
+                            .padding(.top, 100)
+                    } else {
+                        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 16), count: 4), spacing: 16) {
+                            ForEach(api.albums.filter { $0.id != currentAlbumId }) { album in
+                                Button {
+                                    Task {
+                                        await addToAlbum(album)
+                                    }
+                                } label: {
+                                    VStack(spacing: 8) {
+                                        if let thumbnailId = album.albumThumbnailAssetId {
+                                            AsyncThumbnailView(assetId: thumbnailId)
+                                                .aspectRatio(1, contentMode: .fill)
+                                                .frame(height: 120)
+                                                .clipped()
+                                                .cornerRadius(12)
+                                        } else {
+                                            RoundedRectangle(cornerRadius: 12)
+                                                .fill(Color.gray.opacity(0.3))
+                                                .frame(height: 120)
+                                                .overlay {
+                                                    Image(systemName: "photo.on.rectangle")
+                                                        .font(.title)
+                                                        .foregroundStyle(.secondary)
+                                                }
+                                        }
+
+                                        Text(album.albumName)
+                                            .font(.caption)
+                                            .lineLimit(1)
+
+                                        if addedToAlbum == album.id {
+                                            Image(systemName: "checkmark.circle.fill")
+                                                .foregroundStyle(.white)
+                                        }
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(isAdding)
+                            }
+                        }
+                        .padding(.horizontal)
+                        .padding(.bottom)
+                    }
                 }
+                .padding(.top, 8)
             }
             .navigationTitle("Add to Album")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        showNewAlbumField.toggle()
+                        if !showNewAlbumField { newAlbumName = "" }
+                    } label: {
+                        Label("New Album", systemImage: "plus")
+                    }
+                }
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") {
                         onDismiss()
@@ -683,5 +742,23 @@ struct AlbumPickerView: View {
             print("❌ Failed to add to album: \(error)")
         }
         isAdding = false
+    }
+
+    private func createAndAddAlbum() async {
+        let name = newAlbumName.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+
+        isCreatingAlbum = true
+        do {
+            let newAlbum = try await api.createAlbum(name: name, assetIds: selectedAssetIds)
+            await MainActor.run {
+                addedToAlbum = newAlbum.id
+                showNewAlbumField = false
+                newAlbumName = ""
+            }
+        } catch {
+            print("❌ Failed to create album: \(error)")
+        }
+        isCreatingAlbum = false
     }
 }

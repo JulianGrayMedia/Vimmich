@@ -160,12 +160,24 @@ class SpatialPhotoManager: ObservableObject {
         return spatialCache?.isSpatial(assetMetadata[currentIndex].id) ?? false
     }
 
+    /// Check if any asset ID is known to be spatial (from the spatial cache)
+    func isAssetKnownSpatial(_ assetId: String) -> Bool {
+        return spatialCache?.isSpatial(assetId) ?? false
+    }
+
     /// Mark the current asset as spatial (called when detected during playback)
     func markCurrentAssetAsSpatial() {
         guard currentIndex < assetMetadata.count else { return }
         let asset = assetMetadata[currentIndex]
         Task { @MainActor in
             spatialCache?.markAsSpatial(asset.id, asset: asset)
+        }
+    }
+
+    /// Mark any asset as spatial by ID (called when detected during carousel/incoming video playback)
+    func markAssetAsSpatial(_ assetId: String) {
+        Task { @MainActor in
+            spatialCache?.markAsSpatial(assetId)
         }
     }
 
@@ -839,7 +851,10 @@ class SpatialPhotoManager: ObservableObject {
     /// Pre-buffer first portion of a video
     private func preBufferVideo(asset: Asset) async {
         guard let api = api else { return }
-        guard let url = api.getVideoPlaybackURL(assetId: asset.id) else { return }
+        // Must use /original (not /video/playback) to match the streaming URL and preserve
+        // MV-HEVC spatial format. The pre-buffer data must be from the exact same file as
+        // the streaming request, otherwise AVFoundation receives corrupted/mismatched data.
+        guard let url = api.getOriginalImageURL(assetId: asset.id) else { return }
 
         var request = URLRequest(url: url)
         request.setValue("Bearer \(api.getAccessToken())", forHTTPHeaderField: "Authorization")
@@ -892,7 +907,9 @@ class SpatialPhotoManager: ObservableObject {
     /// Get video streaming info for a given asset ID
     func getVideoStreamingInfo(assetId: String) -> (url: URL, accessToken: String)? {
         guard let api = api,
-              let url = api.getVideoPlaybackURL(assetId: assetId),
+              // Must use /original (not /video/playback) to preserve MV-HEVC spatial format
+              // and to match the pre-buffer URL so data is consistent.
+              let url = api.getOriginalImageURL(assetId: assetId),
               !api.getAccessToken().isEmpty else {
             return nil
         }
