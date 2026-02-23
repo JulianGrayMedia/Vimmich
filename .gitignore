@@ -1,6 +1,9 @@
 # Claude Code
 .claude/
 
+# Design assets
+Design/
+
 # Xcode
 *.xcuserstate
 *.xcworkspace/xcuserdata/
