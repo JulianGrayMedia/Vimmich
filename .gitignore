@@ -1,3 +1,6 @@
+# Claude Code
+.claude/
+
 # Xcode
 *.xcuserstate
 *.xcworkspace/xcuserdata/
