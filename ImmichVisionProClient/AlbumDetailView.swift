@@ -550,14 +550,21 @@ struct AsyncThumbnailView: View {
     @State private var image: UIImage?
     @State private var isLoading = true
 
+    /// Falls back to the cache synchronously so the first render after a @State reset
+    /// (e.g. visionOS context menu lift/dismiss) never shows a transparent placeholder frame.
+    private var displayImage: UIImage? {
+        image ?? ThumbnailCache.shared.get(assetId)
+    }
+
     var body: some View {
         GeometryReader { geometry in
-            if let image = image {
+            if let image = displayImage {
                 Image(uiImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
                     .frame(width: geometry.size.width, height: geometry.size.height)
                     .clipped()
+                    .transition(.identity)
             } else if isLoading {
                 Rectangle()
                     .fill(Color.gray.opacity(0.2))
@@ -581,10 +588,14 @@ struct AsyncThumbnailView: View {
     }
 
     private func loadThumbnail() async {
-        // Check cache first
+        // Check cache first — disable animation so context menu dismiss doesn't cause a visible fade-in
         if let cached = ThumbnailCache.shared.get(assetId) {
-            image = cached
-            isLoading = false
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                image = cached
+                isLoading = false
+            }
             return
         }
 
@@ -666,17 +677,15 @@ struct AlbumPickerView: View {
                                         await addToAlbum(album)
                                     }
                                 } label: {
-                                    VStack(spacing: 8) {
+                                    ZStack(alignment: .bottom) {
                                         if let thumbnailId = album.albumThumbnailAssetId {
                                             AsyncThumbnailView(assetId: thumbnailId)
                                                 .aspectRatio(1, contentMode: .fill)
-                                                .frame(height: 120)
                                                 .clipped()
-                                                .cornerRadius(12)
                                         } else {
-                                            RoundedRectangle(cornerRadius: 12)
+                                            Rectangle()
                                                 .fill(Color.gray.opacity(0.3))
-                                                .frame(height: 120)
+                                                .aspectRatio(1, contentMode: .fill)
                                                 .overlay {
                                                     Image(systemName: "photo.on.rectangle")
                                                         .font(.title)
@@ -684,15 +693,36 @@ struct AlbumPickerView: View {
                                                 }
                                         }
 
+                                        // Title overlay at bottom, matching AlbumCard style
                                         Text(album.albumName)
                                             .font(.caption)
+                                            .fontWeight(.medium)
+                                            .foregroundStyle(.white)
                                             .lineLimit(1)
+                                            .shadow(color: .black.opacity(0.4), radius: 2)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .padding(.horizontal, 8)
+                                            .padding(.bottom, 6)
 
+                                        // Success overlay when added — tint + corner checkmark
                                         if addedToAlbum == album.id {
-                                            Image(systemName: "checkmark.circle.fill")
-                                                .foregroundStyle(.white)
+                                            Color.black.opacity(0.35)
+                                            VStack {
+                                                HStack {
+                                                    Spacer()
+                                                    Image(systemName: "checkmark.circle.fill")
+                                                        .font(.system(size: 22, weight: .semibold))
+                                                        .foregroundStyle(.white)
+                                                        .shadow(color: .black.opacity(0.3), radius: 2)
+                                                        .padding(8)
+                                                }
+                                                Spacer()
+                                            }
                                         }
                                     }
+                                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                                    .contentShape(.hoverEffect, RoundedRectangle(cornerRadius: 12))
+                                    .hoverEffect(.highlight)
                                 }
                                 .buttonStyle(.plain)
                                 .disabled(isAdding)

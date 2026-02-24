@@ -65,12 +65,13 @@ struct LibraryView: View {
                                                 )
                                             }
                                             .overlay(alignment: .topTrailing) {
-                                                Image(systemName: "checkmark.icloud.fill")
-                                                    .font(.system(size: 12))
-                                                    .foregroundStyle(.white)
-                                                    .shadow(color: .black.opacity(0.5), radius: 2)
-                                                    .padding(6)
-                                                    .opacity(DiskCache.shared.isAvailableOffline(assetId: asset.id) ? 1 : 0)
+                                                if DiskCache.shared.isAvailableOffline(assetId: asset.id) {
+                                                    Image(systemName: "checkmark.icloud.fill")
+                                                        .font(.system(size: 12))
+                                                        .foregroundStyle(.white)
+                                                        .shadow(color: .black.opacity(0.5), radius: 2)
+                                                        .padding(6)
+                                                }
                                             }
                                             .overlay(alignment: .bottomLeading) {
                                                 HStack(spacing: 4) {

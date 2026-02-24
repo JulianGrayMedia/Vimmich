@@ -147,12 +147,15 @@ struct SelectionToolbarContent: ToolbarContent {
 // MARK: - Context Menu Extension
 
 extension View {
+    @ViewBuilder
     func contextMenuIfNotSelecting<MenuContent: View>(
         isSelectionMode: Bool,
         @ViewBuilder menuContent: () -> MenuContent
     ) -> some View {
-        self.contextMenu {
-            if !isSelectionMode {
+        if isSelectionMode {
+            self
+        } else {
+            self.contextMenu {
                 menuContent()
             }
         }

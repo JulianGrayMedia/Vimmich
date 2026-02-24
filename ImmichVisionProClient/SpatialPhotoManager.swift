@@ -361,10 +361,25 @@ class SpatialPhotoManager: ObservableObject {
 
         // Check album preload cache (populated by album grid views)
         if let preloaded = albumPreloadCache[asset.id] {
-            print("📦 Asset found in album preload cache - instant load!")
+            print("📦 Asset found in album preload cache - instant load! (preview: \(preloaded.isPreviewQuality))")
             cache[asset.id] = preloaded
             if currentIndex == indexToLoad {
                 isLoadingCurrentAsset = false
+            }
+
+            // If the preloaded asset is preview quality, upgrade to full resolution in background.
+            // This is needed for spatial photos: the album preload may have fetched a preview JPEG
+            // (if the asset wasn't in the spatial cache yet), which strips stereo data. The full
+            // original HEIC contains the spatial stereo pair and will show as spatial once loaded.
+            if preloaded.isPreviewQuality, !preloaded.isVideo, let api = api {
+                let diskCache = DiskCache.shared
+                isShowingPreviewQuality = true
+                Task {
+                    print("🔄 Album preload was preview quality, upgrading to full resolution...")
+                    await self.loadImageFromServer(asset: asset, usePreview: false,
+                                                  indexToLoad: indexToLoad, api: api,
+                                                  diskCache: diskCache, isBackgroundUpgrade: true)
+                }
             }
             return
         }

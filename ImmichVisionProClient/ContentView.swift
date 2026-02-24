@@ -49,6 +49,7 @@ enum TabAnimation {
 
 struct ContentView: View {
     @EnvironmentObject var spatialPhotoManager: SpatialPhotoManager
+    @EnvironmentObject var spatialCache: SpatialAssetCache
     @EnvironmentObject var shareManager: ShareManager
     @StateObject private var api = ImmichAPI()
     @State private var selectedTab: PhotoTab = .collection
@@ -66,6 +67,10 @@ struct ContentView: View {
     @State private var isLoggingIn = false
     @State private var loginError: String?
 
+    // Welcome sheet — shown once after first login
+    @AppStorage("hasSeenWelcome") private var hasSeenWelcome = false
+    @State private var showWelcome = false
+
     private enum LoginField { case serverURL, email, password }
     @FocusState private var focusedField: LoginField?
 
@@ -80,6 +85,26 @@ struct ContentView: View {
         .environmentObject(api)
         .sheet(isPresented: $shareManager.showShareSheet) {
             ShareSheetView(shareManager: shareManager)
+        }
+        .sheet(isPresented: $showWelcome) {
+            WelcomeView()
+                .environmentObject(api)
+                .environmentObject(spatialCache)
+        }
+        .onChange(of: api.isLoggedIn) { _, isLoggedIn in
+            if !isLoggedIn {
+                // Reset to collection tab on sign-out so next login starts fresh
+                var t = Transaction()
+                t.disablesAnimations = true
+                withTransaction(t) {
+                    selectedTab = .collection
+                    visuallySelectedTab = .collection
+                    displayedTab = .collection
+                    navigationPath = NavigationPath()
+                }
+                // Reset welcome flag so it shows again after next login
+                hasSeenWelcome = false
+            }
         }
         .task {
             // If we have a saved session, validate it and load data
@@ -196,6 +221,10 @@ struct ContentView: View {
             // Load initial data
             await api.fetchAlbums()
             await api.fetchTimeBuckets()
+            // Show welcome on first login
+            if !hasSeenWelcome {
+                showWelcome = true
+            }
         } catch {
             loginError = error.localizedDescription
         }
@@ -286,7 +315,7 @@ struct ContentView: View {
                         case .spatial:
                             SpatialPhotosView()
                         case .locked:
-                            LockedFolderGateView()
+                            LockedFolderGateView(navigationPath: $navigationPath)
                         case .upload:
                             UploadView()
                         case .settings:
@@ -336,9 +365,9 @@ struct ContentView: View {
             if displayedTab == .library {
                 NavigationStack {
                     LibraryView()
-                        .scaleEffect(contentScale)
-                        .opacity(contentOpacity)
                 }
+                .scaleEffect(contentScale)
+                .opacity(contentOpacity)
                 .clipped()
             }
 
@@ -452,6 +481,7 @@ struct AlbumsGridView: View {
 // MARK: - Locked Folder Gate View
 
 struct LockedFolderGateView: View {
+    @Binding var navigationPath: NavigationPath
     @EnvironmentObject var api: ImmichAPI
 
     private let keychain = KeychainHelper.shared
@@ -525,6 +555,16 @@ struct LockedFolderGateView: View {
             }
         }
         .navigationTitle("Locked")
+        .navigationBarBackButtonHidden(true)
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button {
+                    navigationPath = NavigationPath()
+                } label: {
+                    Image(systemName: "chevron.backward")
+                }
+            }
+        }
         .onAppear {
             // Guard prevents re-triggering if the view flickers during navigation animations
             guard gateState == .checking else { return }
@@ -592,6 +632,8 @@ struct LockedFolderGateView: View {
         do {
             let status = try await api.getAuthStatus()
 
+            guard !Task.isCancelled else { return }
+
             if status.isElevated {
                 await MainActor.run { gateState = .unlocked }
                 return
@@ -606,7 +648,11 @@ struct LockedFolderGateView: View {
         } catch is CancellationError {
             // Task was cancelled (e.g. user navigated away), do nothing
             return
+        } catch let urlError as URLError where urlError.code == .userAuthenticationRequired {
+            // Session was locked during navigation teardown — not a user-visible error
+            return
         } catch {
+            guard !Task.isCancelled else { return }
             await MainActor.run {
                 gateState = .error("Could not check auth status: \(error.localizedDescription)")
             }
@@ -1347,6 +1393,111 @@ struct ShareSheetView: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Welcome View
+
+struct WelcomeView: View {
+    @EnvironmentObject var api: ImmichAPI
+    @EnvironmentObject var spatialCache: SpatialAssetCache
+    @AppStorage("hasSeenWelcome") private var hasSeenWelcome = false
+    @Environment(\.dismiss) var dismiss
+
+    @State private var isLoadingForScan = false
+    @State private var didStartScan = false
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 36) {
+                // Branding
+                VStack(spacing: 14) {
+                    Image("AppLogo")
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 72, height: 72)
+                        .opacity(0.8)
+
+                    Text("Welcome to Vimmich")
+                        .font(.largeTitle)
+                        .fontWeight(.bold)
+                        .multilineTextAlignment(.center)
+
+                    Text("An Immich client for Apple Vision Pro")
+                        .font(.title3)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+
+                // Scan section
+                VStack(spacing: 20) {
+                    Text("Start by scanning your library for spatial images")
+                        .font(.headline)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if didStartScan {
+                        HStack(spacing: 8) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(.white)
+                            Text("Scan started!")
+                                .font(.subheadline)
+                        }
+                    } else {
+                        Button(action: { Task { await startScan() } }) {
+                            HStack(spacing: 8) {
+                                if isLoadingForScan {
+                                    ProgressView()
+                                        .scaleEffect(0.8)
+                                } else {
+                                    Image(systemName: "cube.transparent")
+                                        .font(.system(size: 18))
+                                }
+                                Text(isLoadingForScan ? "Loading library..." : "Scan for Spatial Photos")
+                                    .font(.subheadline)
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(isLoadingForScan)
+                    }
+
+                    Text("This will continue in the background as you browse.\nFind the progress of the scan in the Settings menu.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Button("Get Started") {
+                    hasSeenWelcome = true
+                    dismiss()
+                }
+                .buttonStyle(.bordered)
+
+                Text("Designed by Julian Gray 2026")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary.opacity(0.6))
+            }
+            .padding(40)
+        }
+        .frame(maxWidth: 520)
+    }
+
+    private func startScan() async {
+        isLoadingForScan = true
+        if api.timeBuckets.isEmpty {
+            await api.fetchTimeBuckets()
+        }
+        var assets: [Asset] = []
+        for bucket in api.timeBuckets {
+            do {
+                let bucketAssets = try await api.fetchAssetsForTimeBucket(timeBucket: bucket.timeBucket)
+                assets.append(contentsOf: bucketAssets)
+            } catch {}
+        }
+        isLoadingForScan = false
+        spatialCache.scanLibrary(api: api, assets: assets)
+        didStartScan = true
     }
 }
 

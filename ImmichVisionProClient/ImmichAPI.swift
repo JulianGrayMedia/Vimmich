@@ -1010,8 +1010,14 @@ class ImmichAPI: ObservableObject {
 
         let (data, response) = try await URLSession.shared.data(for: request)
 
-        if let httpResponse = response as? HTTPURLResponse {
-            print("🔐 Auth status response: \(httpResponse.statusCode)")
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw URLError(.badServerResponse)
+        }
+
+        print("🔐 Auth status response: \(httpResponse.statusCode)")
+
+        guard httpResponse.statusCode == 200 else {
+            throw URLError(.userAuthenticationRequired)
         }
 
         return try JSONDecoder().decode(AuthStatusResponse.self, from: data)
