@@ -36,6 +36,7 @@ struct SpatialPhotoImmersiveView: View {
     @State private var isDragging: Bool = false
     @State private var dragDirection: Int = 0  // -1 = left (next), +1 = right (previous), 0 = undetermined
     @State private var incomingPrepared: Bool = false
+    @State private var prepareIncomingTask: Task<Void, Never>? = nil
 
     // Loading state - starts false, enabled after wrapper is positioned
     @State private var showLoading: Bool = false
@@ -256,7 +257,8 @@ struct SpatialPhotoImmersiveView: View {
                             incomingContentEntity.position.z = 0
 
                             // Peek at next/previous asset and prepare it
-                            Task {
+                            prepareIncomingTask?.cancel()
+                            prepareIncomingTask = Task {
                                 await prepareIncomingContent(direction: dragDirection)
                             }
                             incomingPrepared = true
@@ -906,11 +908,11 @@ struct SpatialPhotoImmersiveView: View {
             let remainingProgress = abs(capturedWrapperX - dynamicBasePosition.x) / slideDistance
             let remainingDuration = 0.35 * Double(1.0 - remainingProgress)  // Proportional duration
 
-            if remainingDuration > 0.02 {
+            if remainingDuration > 0.005 {
                 await animateCarouselCompletion(
                     wrapperFromX: capturedWrapperX,
                     wrapperToX: targetWrapperX,
-                    duration: max(0.1, remainingDuration)
+                    duration: remainingDuration
                 )
             }
 
@@ -982,7 +984,7 @@ struct SpatialPhotoImmersiveView: View {
 
         for i in 1...steps {
             let progress = Float(i) / Float(steps)
-            let eased = progress * progress * (3 - 2 * progress)
+            let eased = 1 - pow(1 - progress, 2.5)
 
             wrapperEntity.position.x = wrapperFromX + deltaX * eased
 
@@ -1030,8 +1032,29 @@ struct SpatialPhotoImmersiveView: View {
 
     /// Snap back from drag, clearing incoming content
     private func snapBackFromDrag() {
+        // Set isAnimating synchronously before Task so onChanged is blocked immediately
+        isAnimating = true
+
+        // Cancel any in-progress incoming content load to prevent it adding
+        // children to incomingContentEntity after we clear it
+        prepareIncomingTask?.cancel()
+        prepareIncomingTask = nil
+
+        // Capture positions synchronously so the Task starts animating from
+        // exactly where the drag left off — no frame gap before animation begins
+        let capturedWrapperX = wrapperEntity.position.x
+        let capturedIncomingOpacity = getIncomingContentOpacity()
+
         Task {
-            // Clear incoming content (both photos and videos are in incomingContentEntity)
+            // Animate wrapper back to center AND fade out any visible incoming
+            // content simultaneously — no instant pop/removal before animation
+            await animateSnapBack(
+                fromX: capturedWrapperX,
+                incomingStartOpacity: capturedIncomingOpacity,
+                duration: 0.3
+            )
+
+            // Now safe to remove incoming content — it has been animated to opacity 0
             incomingContentEntity.children.removeAll()
             incomingContentEntity.position = .zero
 
@@ -1042,19 +1065,20 @@ struct SpatialPhotoImmersiveView: View {
             incomingVideoStreamingLoader = nil
 
             showLoading = false
-
-            // Animate back to center with easing
-            await animateSnapBack(duration: 0.35)
             dragOffset = 0
+            isAnimating = false
         }
     }
 
     /// Animate snap back to center with ease-out curve
-    private func animateSnapBack(duration: Double) async {
+    /// - Parameters:
+    ///   - fromX: wrapper X at the moment snap-back was triggered (captured synchronously)
+    ///   - incomingStartOpacity: opacity of incoming content at snap-back trigger (to fade out smoothly)
+    ///   - duration: animation duration in seconds
+    private func animateSnapBack(fromX: Float, incomingStartOpacity: Float, duration: Double) async {
         let steps = 20
-        let startX = wrapperEntity.position.x
         let targetX = dynamicBasePosition.x
-        let deltaX = targetX - startX
+        let deltaX = targetX - fromX
         let stepDuration = duration / Double(steps)
 
         let startOpacity = getCurrentContentOpacity()
@@ -1068,7 +1092,7 @@ struct SpatialPhotoImmersiveView: View {
             // Ease-out curve - starts fast, slows at end
             let eased = 1 - pow(1 - progress, 3)
 
-            let newX = startX + deltaX * eased
+            let newX = fromX + deltaX * eased
             wrapperEntity.position.x = newX
 
             // Animate content Z back to 0 (applies to both photos and videos)
@@ -1080,9 +1104,13 @@ struct SpatialPhotoImmersiveView: View {
             // Sync loading entity
             loadingEntity?.position.x = newX
 
-            // Restore opacity (applies to both photos and videos via setContentOpacity)
-            let newOpacity = startOpacity + deltaOpacity * eased
-            setContentOpacity(newOpacity)
+            // Restore old content opacity
+            setContentOpacity(startOpacity + deltaOpacity * eased)
+
+            // Fade out any incoming content that was visible — prevents instant pop on removal
+            if incomingStartOpacity > 0 {
+                setIncomingContentOpacity(incomingStartOpacity * (1 - eased))
+            }
 
             try? await Task.sleep(for: .milliseconds(Int(stepDuration * 1000)))
         }
@@ -1094,6 +1122,9 @@ struct SpatialPhotoImmersiveView: View {
         }
         loadingEntity?.position.x = targetX
         setContentOpacity(1.0)
+        if incomingStartOpacity > 0 {
+            setIncomingContentOpacity(0)
+        }
     }
 
     // MARK: - Animations

@@ -365,9 +365,9 @@ struct ContentView: View {
             if displayedTab == .library {
                 NavigationStack {
                     LibraryView()
+                        .scaleEffect(contentScale)
+                        .opacity(contentOpacity)
                 }
-                .scaleEffect(contentScale)
-                .opacity(contentOpacity)
                 .clipped()
             }
 

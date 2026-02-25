@@ -145,13 +145,6 @@ struct SpatialPhotosView: View {
                                             }
                                         }
                                     }
-                                    // Suppress reorder animations while scanning — as new spatial
-                                    // assets are discovered the array re-sorts by date, causing
-                                    // every existing cell to animate to a new position, which
-                                    // creates a visual glitch. Disable during active scans.
-                                    .transaction { tx in
-                                        if spatialCache.isScanning { tx.animation = nil }
-                                    }
 
                                     // Extra bottom padding for batch action bar
                                     if isSelectionMode && !selectedAssetIds.isEmpty {
