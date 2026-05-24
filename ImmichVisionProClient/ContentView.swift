@@ -315,7 +315,7 @@ struct ContentView: View {
                         case .spatial:
                             SpatialPhotosView()
                         case .locked:
-                            LockedFolderGateView(navigationPath: $navigationPath)
+                            LockedFolderGateView()
                         case .upload:
                             UploadView()
                         case .settings:
@@ -481,8 +481,8 @@ struct AlbumsGridView: View {
 // MARK: - Locked Folder Gate View
 
 struct LockedFolderGateView: View {
-    @Binding var navigationPath: NavigationPath
     @EnvironmentObject var api: ImmichAPI
+    @Environment(\.dismiss) var dismiss
 
     private let keychain = KeychainHelper.shared
 
@@ -559,7 +559,7 @@ struct LockedFolderGateView: View {
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
                 Button {
-                    navigationPath = NavigationPath()
+                    dismiss()
                 } label: {
                     Image(systemName: "chevron.backward")
                 }
@@ -601,6 +601,7 @@ struct LockedFolderGateView: View {
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 200)
                 .multilineTextAlignment(.center)
+                .textContentType(.oneTimeCode)
                 .focused($isPINFocused)
                 .onSubmit { Task { await unlock() } }
 
@@ -675,6 +676,7 @@ struct LockedFolderGateView: View {
                 pinError = "Wrong PIN. Please try again."
                 pinCode = ""
                 isUnlocking = false
+                isPINFocused = true
             }
         }
     }
