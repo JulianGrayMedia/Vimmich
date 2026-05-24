@@ -950,43 +950,47 @@ class ImmichAPI: ObservableObject {
         }
     }
 
-    /// Fetch assets with locked visibility (hidden folder)
+    /// Fetch assets with locked visibility (hidden folder), paginating through all pages
     func fetchLockedAssets() async throws -> [Asset] {
-        guard let url = URL(string: "\(baseURL)/api/search/metadata") else {
-            throw URLError(.badURL)
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-
-        let body: [String: String] = ["visibility": "locked"]
-        request.httpBody = try JSONEncoder().encode(body)
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-
-        if let httpResponse = response as? HTTPURLResponse {
-            print("🔒 Locked assets response: \(httpResponse.statusCode)")
-        }
-
-        // Debug: log raw response for troubleshooting decode failures
-        if let rawString = String(data: data, encoding: .utf8) {
-            print("🔒 Raw locked response (first 500 chars): \(String(rawString.prefix(500)))")
-        }
-
-        // The search endpoint returns { assets: { items: [Asset], ... }, ... }
         struct SearchResponse: Decodable {
             struct AssetResult: Decodable {
                 let items: [Asset]
+                let nextPage: String?
             }
             let assets: AssetResult
         }
 
-        let decoded = try JSONDecoder().decode(SearchResponse.self, from: data)
-        print("🔒 Found \(decoded.assets.items.count) locked asset(s)")
-        return decoded.assets.items
+        var allAssets: [Asset] = []
+        var nextPage: String? = "1"
+
+        while let page = nextPage {
+            guard let url = URL(string: "\(baseURL)/api/search/metadata") else {
+                throw URLError(.badURL)
+            }
+
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+            let body: [String: Any] = ["visibility": "locked", "page": Int(page) ?? 1]
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+
+            if let httpResponse = response as? HTTPURLResponse {
+                print("🔒 Locked assets response (page \(page)): \(httpResponse.statusCode)")
+            }
+
+            let decoded = try JSONDecoder().decode(SearchResponse.self, from: data)
+            allAssets.append(contentsOf: decoded.assets.items)
+            nextPage = decoded.assets.nextPage
+            print("🔒 Page \(page): \(decoded.assets.items.count) assets, nextPage: \(nextPage ?? "nil")")
+        }
+
+        print("🔒 Total locked assets fetched: \(allAssets.count)")
+        return allAssets
     }
 
     // MARK: - Locked Folder Auth

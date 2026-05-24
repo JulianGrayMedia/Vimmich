@@ -424,7 +424,6 @@ struct LibraryView: View {
                 print("📚 Library: Total loaded assets now: \(loadedAssets.count)")
             }
 
-            triggerBackgroundScanIfNeeded(for: assets)
         } catch {
             print("❌ Library: Error loading bucket \(bucket.timeBucket): \(error)")
         }
@@ -481,21 +480,6 @@ struct LibraryView: View {
             spatialCache: spatialCache
         )
         await openImmersiveSpace(id: "SpatialPhotoViewer")
-    }
-
-    private func triggerBackgroundScanIfNeeded(for assets: [Asset]) {
-        let unscannedAssets = assets.filter { !spatialCache.hasBeenScanned($0.id) }
-
-        if unscannedAssets.isEmpty {
-            print("📊 All \(assets.count) assets already scanned")
-            return
-        }
-
-        print("🔍 Starting background scan for \(unscannedAssets.count) unscanned assets")
-
-        Task.detached(priority: .background) { [api, spatialCache] in
-            await spatialCache.scanAssetsInBackground(api: api, assets: unscannedAssets)
-        }
     }
 
     private func toggleOffline(asset: Asset) async {
