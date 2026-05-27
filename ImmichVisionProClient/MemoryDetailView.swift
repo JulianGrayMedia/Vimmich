@@ -15,7 +15,7 @@ struct MemoryDetailView: View {
     @State private var hasRestoredScroll = false
     @State private var wasDisplayingImmersive = false
 
-    @Environment(\.openImmersiveSpace) var openImmersiveSpace
+    @Environment(\.openWindow) var openWindow
 
     let columns = Array(repeating: GridItem(.flexible(), spacing: 0), count: 5)
 
@@ -151,8 +151,7 @@ struct MemoryDetailView: View {
             ),
             spatialCache: spatialCache
         )
-        // Main window stays open but hidden via opacity controlled by spatialPhotoManager.isDisplaying
-        await openImmersiveSpace(id: "SpatialPhotoViewer")
+        openWindow(id: "photoViewer")
     }
 }
 

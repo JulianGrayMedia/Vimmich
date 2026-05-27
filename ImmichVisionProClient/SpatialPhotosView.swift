@@ -28,7 +28,6 @@ struct SpatialPhotosView: View {
 
     @Environment(\.openWindow) var openWindow
     @Environment(\.dismissWindow) var dismissWindow
-    @Environment(\.openImmersiveSpace) var openImmersiveSpace
 
     let columns = Array(repeating: GridItem(.flexible(), spacing: 0), count: 5)
 
@@ -509,7 +508,7 @@ struct SpatialPhotosView: View {
             ),
             spatialCache: spatialCache
         )
-        await openImmersiveSpace(id: "SpatialPhotoViewer")
+        openWindow(id: "photoViewer")
     }
 
     private func toggleOffline(asset: Asset) async {

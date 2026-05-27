@@ -9,6 +9,7 @@ import Foundation
 import SwiftUI
 import Combine
 import ImageIO
+import ARKit
 
 /// Tracks progress for an individual download
 struct DownloadProgress: Identifiable {
@@ -108,6 +109,13 @@ class SpatialPhotoManager: ObservableObject {
     // Published property for current full asset details (fetched on demand)
     @Published var currentFullAssetDetails: Asset?
     @Published var isLoadingAssetDetails = false
+
+    // ARKit session for head-tracked spawn positioning
+    private let arkitSession = ARKitSession()
+    private let worldTracking = WorldTrackingProvider()
+    private var isWorldTrackingStarted = false
+    // Captured just before openImmersiveSpace — where the user was looking at tap time
+    private(set) var spawnPosition: SIMD3<Float> = [0, 1.1, -1.5]
 
     // Album preload cache - persists across clear() for instant loading from album grids
     // This cache is populated by album views and checked before downloading
@@ -224,7 +232,33 @@ class SpatialPhotoManager: ObservableObject {
         return assetMetadata[index]
     }
 
+    func startWorldTracking() async {
+        guard !isWorldTrackingStarted, WorldTrackingProvider.isSupported else { return }
+        isWorldTrackingStarted = true
+        do {
+            try await arkitSession.run([worldTracking])
+            print("📍 World tracking started")
+        } catch {
+            print("📍 World tracking failed to start: \(error)")
+            isWorldTrackingStarted = false
+        }
+    }
+
+    private func captureSpawnPosition() {
+        guard let anchor = worldTracking.queryDeviceAnchor(atTimestamp: CACurrentMediaTime()) else {
+            print("📍 No device anchor — using previous spawn position")
+            return
+        }
+        let t = anchor.originFromAnchorTransform
+        let headPos = SIMD3<Float>(t.columns.3.x, t.columns.3.y, t.columns.3.z)
+        let forward = normalize(SIMD3<Float>(-t.columns.2.x, -t.columns.2.y, -t.columns.2.z))
+        spawnPosition = headPos + forward * 1.5
+        print("📍 Spawn position captured: \(spawnPosition)")
+    }
+
     func configure(api: ImmichAPI, assets: [Asset], startingAt index: Int, album: Album, spatialCache: SpatialAssetCache? = nil) {
+        captureSpawnPosition()
+
         // Cancel any existing tasks
         currentLoadTask?.cancel()
         preloadTask?.cancel()

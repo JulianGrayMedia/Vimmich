@@ -51,7 +51,7 @@ struct ContentView: View {
     @EnvironmentObject var spatialPhotoManager: SpatialPhotoManager
     @EnvironmentObject var spatialCache: SpatialAssetCache
     @EnvironmentObject var shareManager: ShareManager
-    @StateObject private var api = ImmichAPI()
+    @EnvironmentObject var api: ImmichAPI
     @State private var selectedTab: PhotoTab = .collection
     @State private var navigationPath = NavigationPath()
     @State private var visuallySelectedTab: PhotoTab = .collection  // For ornament highlighting
@@ -107,6 +107,7 @@ struct ContentView: View {
             }
         }
         .task {
+            await spatialPhotoManager.startWorldTracking()
             // If we have a saved session, validate it and load data
             if api.isLoggedIn {
                 let isValid = await api.validateSession()
@@ -607,8 +608,10 @@ struct LockedFolderGateView: View {
 
             if let error = pinError {
                 Text(error)
-                    .foregroundStyle(.white)
+                    .foregroundStyle(.red)
                     .font(.callout)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 300)
             }
 
             Button(action: {
@@ -671,12 +674,17 @@ struct LockedFolderGateView: View {
                 gateState = .unlocked
                 isUnlocking = false
             }
-        } catch {
+        } catch let urlError as URLError where urlError.code == .userAuthenticationRequired {
             await MainActor.run {
                 pinError = "Wrong PIN. Please try again."
                 pinCode = ""
                 isUnlocking = false
                 isPINFocused = true
+            }
+        } catch {
+            await MainActor.run {
+                pinError = "Connection error. Please try again."
+                isUnlocking = false
             }
         }
     }
@@ -699,7 +707,7 @@ struct LockedFolderView: View {
     @State private var isPerformingBatchAction = false
     @State private var showBatchDeleteConfirmation = false
 
-    @Environment(\.openImmersiveSpace) var openImmersiveSpace
+    @Environment(\.openWindow) var openWindow
 
     let columns = Array(repeating: GridItem(.flexible(), spacing: 0), count: 5)
 
@@ -1010,7 +1018,7 @@ struct LockedFolderView: View {
             ),
             spatialCache: spatialCache
         )
-        await openImmersiveSpace(id: "SpatialPhotoViewer")
+        openWindow(id: "photoViewer")
     }
 
     private func unhideAsset(_ asset: Asset) async {

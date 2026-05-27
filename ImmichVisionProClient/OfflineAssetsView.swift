@@ -20,7 +20,6 @@ struct OfflineAssetsView: View {
 
     @Environment(\.openWindow) var openWindow
     @Environment(\.dismissWindow) var dismissWindow
-    @Environment(\.openImmersiveSpace) var openImmersiveSpace
 
     let columns = Array(repeating: GridItem(.flexible(), spacing: 0), count: 5)
 
@@ -218,8 +217,7 @@ struct OfflineAssetsView: View {
         try? await Task.sleep(for: .milliseconds(100))
 
         isOpeningViewer = false
-        // Main window stays open but hidden via opacity controlled by spatialPhotoManager.isDisplaying
-        await openImmersiveSpace(id: "SpatialPhotoViewer")
+        openWindow(id: "photoViewer")
     }
 }
 

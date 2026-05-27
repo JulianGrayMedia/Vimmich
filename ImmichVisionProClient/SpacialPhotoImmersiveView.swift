@@ -16,7 +16,6 @@ struct SpatialPhotoImmersiveView: View {
     @EnvironmentObject var spatialPhotoManager: SpatialPhotoManager
     @EnvironmentObject var shareManager: ShareManager
     @Environment(\.dismissWindow) var dismissWindow
-    @Environment(\.dismissImmersiveSpace) var dismissImmersiveSpace
     @Environment(\.openWindow) var openWindow
 
     // Wrapper entity for movement (has collision for gesture)
@@ -27,9 +26,6 @@ struct SpatialPhotoImmersiveView: View {
 
     // Incoming content entity for carousel transitions (child of wrapper)
     @State private var incomingContentEntity: Entity = Entity()
-
-    // Loading attachment entity (added to content root, position synced with wrapper)
-    @State private var loadingEntity: Entity? = nil
 
     // Drag tracking
     @State private var dragOffset: Float = 0
@@ -75,15 +71,19 @@ struct SpatialPhotoImmersiveView: View {
     @State private var preCreatedVideoEntities: [String: (player: AVPlayer, entity: Entity, loader: VideoStreamingLoader)] = [:]
     @State private var preCreateVideoTask: Task<Void, Never>? = nil
 
-    // ARKit for head tracking
-    private let arkitSession = ARKitSession()
-    private let worldTracking = WorldTrackingProvider()
+    // Off-screen entity that holds pre-loaded video entities so VideoPlayerComponent
+    // can decode frames before the user swipes to them.
+    @State private var preloadEntity: Entity = Entity()
 
-    // Dynamic base position - centered in volumetric window
+
+    // Base position for RealityKit content (window center = [0,0,0])
     @State private var dynamicBasePosition: SIMD3<Float> = [0, 0, 0]
 
-    // For volumetric window, content is at center
-    private let contentDistance: Float = 0
+    // Actual window size — updated by GeometryReader so scale targets always match the window
+    @State private var windowSize: CGSize = CGSize(width: 3000, height: 2000)
+
+    // Minimum window size — set after each asset loads so window can't clip the entity
+    @State private var minWindowSize: CGSize = CGSize(width: 400, height: 300)
 
     // How far to slide before triggering navigation (in meters)
     private let swipeThreshold: Float = 0.1
@@ -124,29 +124,17 @@ struct SpatialPhotoImmersiveView: View {
 
             content.add(wrapperEntity)
 
-            // Add controls - position below content and slightly in front
-            if let controlsAttachment = attachments.entity(for: "controls") {
-                // Controls at about 0.45m below content, 0.15m in front (keeping within volume bounds)
-                controlsAttachment.position = [0, initialPosition.y - 0.45, initialPosition.z + 0.15]
-                content.add(controlsAttachment)
-            }
+            // Preload entity holds adjacent video entities at opacity 0 so their
+            // VideoPlayerComponent decodes frames before the user swipes to them.
+            preloadEntity.name = "preloadEntity"
+            content.add(preloadEntity)
 
-            // Add video timeline - position just above the controls
-            if let timelineAttachment = attachments.entity(for: "videoTimeline") {
-                // Timeline right above controls, pushed back slightly for depth
-                timelineAttachment.position = [0, initialPosition.y - 0.38, initialPosition.z + 0.10]
-                content.add(timelineAttachment)
-            }
-
-            // Add loading placeholder - wrap in parent entity for reliable positioning
-            if let loadingAttachment = attachments.entity(for: "loading") {
-                let loadingParent = Entity()
-                loadingParent.name = "loadingParent"
-                loadingParent.position = initialPosition
-                loadingAttachment.position = .zero  // Attachment at parent's origin
-                loadingParent.addChild(loadingAttachment)
-                loadingEntity = loadingParent
-                content.add(loadingParent)
+            // Loading indicator lives as a RealityKit attachment so it sits at the
+            // same z depth as the content (-0.20m behind the window plane), not floating
+            // at the window surface in front of where the photo will appear.
+            if let loadingAnchor = attachments.entity(for: "loadingIndicator") {
+                loadingAnchor.position = initialPosition  // [0, 0, -0.20]
+                content.add(loadingAnchor)
             }
 
             // Store the position for later use
@@ -168,61 +156,19 @@ struct SpatialPhotoImmersiveView: View {
             // Pre-create video entities for adjacent videos (runs after pre-buffering has time to complete)
             preCreateAdjacentVideoEntities()
 
-        } update: { content, attachments in
-            // Update loading visibility and sync position with wrapper
-            // loadingEntity is the parent entity that holds the attachment
-            if let loadingParent = loadingEntity {
-                loadingParent.isEnabled = showLoading
-                // Keep loading indicator at same position as wrapper (follows during drag)
-                loadingParent.position = wrapperEntity.position
-            }
-
+        } update: { _, _ in
         } attachments: {
-            // Controls
-            Attachment(id: "controls") {
-                ControlsContentView(
-                    spatialPhotoManager: spatialPhotoManager,
-                    showInfoPanel: $showInfoPanel,
-                    isPreparingShare: isPreparingShare,
-                    isCurrentAssetBeingSaved: isCurrentAssetBeingSaved,
-                    showControls: showControls,
-                    onNavigatePrevious: { navigatePrevious() },
-                    onNavigateNext: { navigateNext() },
-                    onShowControlsTemporarily: { showControlsTemporarily() },
-                    onPrepareAndShare: { Task { await prepareAndShare() } },
-                    onHideAsset: { Task { await hideCurrentAsset() } },
-                    onSaveOffline: { Task { let _ = await spatialPhotoManager.saveCurrentAssetOffline() } },
-                    onDismiss: { Task { await dismissImmersiveSpace(); spatialPhotoManager.clear() } },
-                    formatBytes: formatBytes
-                )
+            Attachment(id: "loadingIndicator") {
+                LoadingPlaceholderView(isVisible: showLoading)
             }
-
-            // Video timeline (separate from main controls)
-            Attachment(id: "videoTimeline") {
-                if spatialPhotoManager.currentAsset?.isVideo == true && videoDuration > 0 {
-                    VideoTimelineView(
-                        currentTime: $videoCurrentTime,
-                        duration: videoDuration,
-                        isPlaying: isVideoPlaying,
-                        isSeeking: $isSeeking,
-                        onSeek: { seekVideo(to: $0) },
-                        onPlayPause: { toggleVideoPlayback() },
-                        onInteraction: { showControlsTemporarily() }
-                    )
-                    .opacity(showControls ? 1 : 0)
-                    .animation(.easeInOut(duration: 0.25), value: showControls)
-                    .allowsHitTesting(showControls)
-                }
+        }
+        .frame(minWidth: minWindowSize.width, minHeight: minWindowSize.height)
+        .background {
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear { windowSize = geo.size }
+                    .onChange(of: geo.size) { _, size in windowSize = size }
             }
-
-            // Loading placeholder - adapts to asset type
-            Attachment(id: "loading") {
-                LoadingPlaceholderView(
-                    spatialPhotoManager: spatialPhotoManager,
-                    isVisible: showLoading
-                )
-            }
-
         }
         .gesture(
             DragGesture(minimumDistance: 5)
@@ -256,6 +202,18 @@ struct SpatialPhotoImmersiveView: View {
                             incomingContentEntity.position.x = incomingStartX
                             incomingContentEntity.position.z = 0
 
+                            // Show thumbnail immediately as placeholder for photos only.
+                            // Skip for videos — the thumbnail is a blurry still that lingers
+                            // during the animation; the video entity handles its own first frame.
+                            let thumbOffset = dragDirection == -1 ? 1 : -1
+                            let targetIndex = dragDirection == -1
+                                ? spatialPhotoManager.currentIndex + 1
+                                : spatialPhotoManager.currentIndex - 1
+                            let targetIsVideo = spatialPhotoManager.assetMetadata(at: targetIndex)?.type == .VIDEO
+                            if !targetIsVideo, let thumb = spatialPhotoManager.getThumbnailAt(offset: thumbOffset) {
+                                Task { await preloadThumbnailIntoIncoming(thumb) }
+                            }
+
                             // Peek at next/previous asset and prepare it
                             prepareIncomingTask?.cancel()
                             prepareIncomingTask = Task {
@@ -269,39 +227,41 @@ struct SpatialPhotoImmersiveView: View {
                     let newX = dynamicBasePosition.x + dragOffset
                     wrapperEntity.position.x = newX
 
-                    // Calculate Z offset - push OLD content back as it moves away
-                    // Apply to content children directly (not wrapper) so incoming stays at base Z
                     let dragDistance = abs(dragOffset)
-                    let zOffset = min(dragDistance / slideDistance, 1.0) * -0.4
+                    let dragProgress = min(1.0, dragDistance / slideDistance)
+
+                    // Fade out old content linearly — never hits near-zero before release.
+                    setContentOpacity(max(0.0, 1.0 - dragProgress))
+
+                    // Subtle Z push on outgoing (max 0.06m — stays well within plain-window clip range).
+                    let zOffset: Float = dragProgress * -0.06
                     for child in contentEntity.children {
                         child.position.z = zOffset
                     }
 
-                    // Fade out old content (videos are now in contentEntity, so setContentOpacity handles both)
-                    // Opacity goes from 1.0 to 0.0 with exponential curve (fades faster, reaches 0 sooner)
-                    let dragProgress = min(1.0, dragDistance / slideDistance)
-                    let oldOpacity = max(0.0, pow(1.0 - dragProgress, 2.0))  // Quadratic ease-out
-                    setContentOpacity(oldOpacity)
-
-                    // Update incoming content opacity and Z position (videos are now in incomingContentEntity, so this handles both)
+                    // Incoming content: fade in + subtle Z come-forward effect.
                     if incomingPrepared && dragDirection != 0 {
-                        let incomingProgress = min(1.0, dragDistance / slideDistance)
-                        let incomingOpacity = incomingProgress  // 0.0 to 1.0 as drag progresses
-                        setIncomingContentOpacity(incomingOpacity)
-
-                        // Incoming content starts pushed back and comes forward as it slides in
-                        let incomingZOffset = (1.0 - incomingProgress) * -0.4
-                        for child in incomingContentEntity.children {
-                            child.position.z = incomingZOffset
+                        let incomingOpacity = min(1.0, dragDistance / slideDistance)
+                        if let videoEntity = incomingVideoEntity,
+                           let vc = videoEntity.components[VideoPlayerComponent.self] {
+                            let s = vc.playerScreenSize
+                            if s.x > 0 && s.y > 0 {
+                                // Apply (or correct) scale each frame — playerScreenSize may have
+                                // just become available since last event.
+                                let targetScale = windowFitScale(entityWidth: s.x, entityHeight: s.y)
+                                if abs(videoEntity.scale.x - targetScale) > 0.001 {
+                                    videoEntity.scale = SIMD3<Float>(repeating: targetScale)
+                                }
+                                setIncomingContentOpacity(incomingOpacity)
+                            }
+                            // playerScreenSize still zero — keep entity hidden this frame
+                        } else {
+                            setIncomingContentOpacity(incomingOpacity)
                         }
-
-                        // Position loading indicator with incoming content
-                        let incomingWorldX = dynamicBasePosition.x + Float(-dragDirection) * slideDistance * (1 - incomingProgress)
-                        loadingEntity?.position.x = incomingWorldX
-                        loadingEntity?.position.z = dynamicBasePosition.z
-                    } else {
-                        // No incoming, loading follows old content
-                        loadingEntity?.position.x = newX
+                        let incomingZ: Float = -0.06 * (1.0 - incomingOpacity)
+                        for child in incomingContentEntity.children {
+                            child.position.z = incomingZ
+                        }
                     }
                 }
                 .onEnded { value in
@@ -362,11 +322,71 @@ struct SpatialPhotoImmersiveView: View {
                 }
             }
         }
+        .onChange(of: windowSize) { _, _ in
+            guard !isDragging && !isAnimating else { return }
+            rescaleCurrentEntity()
+        }
+        .onChange(of: spatialPhotoManager.isDisplaying) { _, isDisplaying in
+            if !isDisplaying {
+                // Clear all entities so the invisible idle window doesn't intercept input
+                contentEntity.children.removeAll()
+                incomingContentEntity.children.removeAll()
+                preloadEntity.children.removeAll()
+                preCreateVideoTask?.cancel()
+                preCreateVideoTask = nil
+                preCreatedVideoEntities.values.forEach { $0.player.pause() }
+                preCreatedVideoEntities.removeAll()
+                sceneVideoEntity = nil
+                videoPlayer?.pause()
+                videoPlayer = nil
+                videoStreamingLoader = nil
+                showLoading = false
+                showControls = false
+                showInfoPanel = false
+                hideControlsTask?.cancel()
+                cleanupVideoObserver()
+                wrapperEntity.components.remove(InputTargetComponent.self)
+            }
+        }
         .onDisappear {
+            // Fires only if the OS dismisses the window (system close gesture)
             spatialPhotoManager.isDisplaying = false
             spatialPhotoManager.clear()
             hideControlsTask?.cancel()
             cleanupVideoObserver()
+        }
+        .ornament(attachmentAnchor: .scene(.bottom)) {
+            VStack(spacing: 0) {
+                if spatialPhotoManager.currentAsset?.isVideo == true && videoDuration > 0 {
+                    VideoTimelineView(
+                        currentTime: $videoCurrentTime,
+                        duration: videoDuration,
+                        isPlaying: isVideoPlaying,
+                        isSeeking: $isSeeking,
+                        onSeek: { seekVideo(to: $0) },
+                        onPlayPause: { toggleVideoPlayback() },
+                        onInteraction: { showControlsTemporarily() }
+                    )
+                    .opacity(showControls ? 1 : 0)
+                    .animation(.easeInOut(duration: 0.25), value: showControls)
+                    .allowsHitTesting(showControls)
+                }
+                ControlsContentView(
+                    spatialPhotoManager: spatialPhotoManager,
+                    showInfoPanel: $showInfoPanel,
+                    isPreparingShare: isPreparingShare,
+                    isCurrentAssetBeingSaved: isCurrentAssetBeingSaved,
+                    showControls: showControls,
+                    onNavigatePrevious: { navigatePrevious() },
+                    onNavigateNext: { navigateNext() },
+                    onShowControlsTemporarily: { showControlsTemporarily() },
+                    onPrepareAndShare: { Task { await prepareAndShare() } },
+                    onHideAsset: { Task { await hideCurrentAsset() } },
+                    onSaveOffline: { Task { let _ = await spatialPhotoManager.saveCurrentAssetOffline() } },
+                    onDismiss: { spatialPhotoManager.clear(); dismissWindow(id: "photoViewer") },
+                    formatBytes: formatBytes
+                )
+            }
         }
     }
 
@@ -474,7 +494,6 @@ struct SpatialPhotoImmersiveView: View {
         // Now reset wrapper and incoming positions
         wrapperEntity.position = dynamicBasePosition
         incomingContentEntity.position = .zero
-        loadingEntity?.position = dynamicBasePosition
 
         // Step 6: Handle post-transition
         if loadedIntoIncoming {
@@ -489,6 +508,31 @@ struct SpatialPhotoImmersiveView: View {
     }
 
     /// Load a photo into a specific entity (for carousel transitions)
+    /// Load a thumbnail CGImage into incomingContentEntity as an immediate placeholder.
+    /// prepareIncomingContent will replace it with the full-res entity when ready.
+    private func preloadThumbnailIntoIncoming(_ thumbnail: CGImage) async {
+        guard incomingContentEntity.children.isEmpty else { return }
+        do {
+            let tempURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("thumb_\(UUID().uuidString)")
+                .appendingPathExtension("heic")
+            let image = UIImage(cgImage: thumbnail)
+            guard let data = image.heicData() ?? image.jpegData(compressionQuality: 0.85) else { return }
+            try data.write(to: tempURL)
+            defer { try? FileManager.default.removeItem(at: tempURL) }
+            let component = try await ImagePresentationComponent(contentsOf: tempURL)
+            guard incomingContentEntity.children.isEmpty else { return }
+            let thumbEntity = Entity()
+            // Thumbnail dimensions in pixels → meters (1px ≈ 0.001m) for rough placeholder scale
+            let scale = windowFitScale(entityWidth: Float(thumbnail.width) * 0.001, entityHeight: Float(thumbnail.height) * 0.001)
+            thumbEntity.scale = SIMD3<Float>(repeating: scale)
+            thumbEntity.components.set(OpacityComponent(opacity: 0.0))
+            thumbEntity.components.set(component)
+            incomingContentEntity.addChild(thumbEntity)
+            showLoading = false
+        } catch {}
+    }
+
     private func loadPhotoIntoEntity(_ asset: SpatialPhotoManager.SpatialAssetData, entity: Entity, initialOpacity: Float) async {
         do {
             let tempURL = FileManager.default.temporaryDirectory
@@ -499,27 +543,23 @@ struct SpatialPhotoImmersiveView: View {
 
             var component = try await ImagePresentationComponent(contentsOf: tempURL)
 
-            // Debug: Log available viewing modes
             print("🖼️ Available viewing modes: \(component.availableViewingModes)")
 
-            // Use spatialStereoImmersive for blurry edge effect (requires ImmersiveSpace)
-            if component.availableViewingModes.contains(.spatialStereoImmersive) {
-                component.desiredViewingMode = .spatialStereoImmersive
-                print("🖼️ Using spatialStereoImmersive viewing mode (blurry edges)")
-            } else if component.availableViewingModes.contains(.spatialStereo) {
+            // In a volumetric window, use spatialStereo for portal depth effect.
+            if component.availableViewingModes.contains(.spatialStereo) {
                 component.desiredViewingMode = .spatialStereo
-                print("🖼️ Using spatialStereo viewing mode (fallback)")
+                print("🖼️ Using spatialStereo viewing mode (portal depth)")
             }
 
+            guard !Task.isCancelled else { return }
+
             let photoEntity = Entity()
-
-            // Set opacity and add to scene BEFORE setting image component
-            photoEntity.components.set(OpacityComponent(opacity: initialOpacity))
             photoEntity.components.set(HoverEffectComponent())
-            entity.addChild(photoEntity)
 
-            // Now set the image component
+            entity.children.removeAll()
+            entity.addChild(photoEntity)
             photoEntity.components.set(component)
+            photoEntity.components.set(OpacityComponent(opacity: initialOpacity))
 
             // Cleanup temp file
             Task {
@@ -549,11 +589,6 @@ struct SpatialPhotoImmersiveView: View {
         // Get starting opacities
         let oldStartOpacity = getCurrentContentOpacity()
 
-        // Calculate incoming content's world position (starts off-screen, ends at center)
-        let incomingRelativeX = incomingContentEntity.position.x
-        let incomingStartWorldX = startX + incomingRelativeX
-        let incomingEndWorldX = dynamicBasePosition.x  // Ends at center
-
         for i in 1...steps {
             let progress = Float(i) / Float(steps)
             // Smooth ease-out curve for fluid deceleration
@@ -565,13 +600,6 @@ struct SpatialPhotoImmersiveView: View {
             let newZ = startZ + deltaZ * eased
             wrapperEntity.position.x = newX
             wrapperEntity.position.z = newZ
-
-            // Calculate incoming content's current world position
-            let incomingCurrentWorldX = incomingStartWorldX + (incomingEndWorldX - incomingStartWorldX) * eased
-
-            // Sync loading indicator with incoming content (slides in from off-screen)
-            loadingEntity?.position.x = incomingCurrentWorldX
-            loadingEntity?.position.z = dynamicBasePosition.z
 
             // Fade out old content smoothly (applies to both photos and videos)
             setContentOpacity(oldStartOpacity * (1 - eased))
@@ -594,8 +622,6 @@ struct SpatialPhotoImmersiveView: View {
         // Ensure final positions and opacities
         wrapperEntity.position.x = wrapperToX
         wrapperEntity.position.z = wrapperToZ
-        loadingEntity?.position.x = dynamicBasePosition.x
-        loadingEntity?.position.z = dynamicBasePosition.z
         setContentOpacity(0)
         if incomingHasContent {
             setIncomingContentOpacity(1.0)
@@ -632,47 +658,68 @@ struct SpatialPhotoImmersiveView: View {
 
         guard targetIndex >= 0 && targetIndex < spatialPhotoManager.totalAssets else { return }
 
-        // Try to get cached asset data for the target index
-        if let asset = spatialPhotoManager.peekAsset(at: targetIndex) {
+        // Check for a pre-warmed video entity first — uses only asset metadata so this
+        // works even when the video data hasn't downloaded yet (peekAsset would return nil).
+        let targetMetadata = spatialPhotoManager.assetMetadata(at: targetIndex)
+        if let meta = targetMetadata,
+           meta.type == .VIDEO,
+           let preCreated = preCreatedVideoEntities[meta.id] {
+            incomingContentEntity.children.removeAll()
+
+            // Move from preloadEntity (where it was warming up) into the carousel slot
+            preCreated.entity.removeFromParent()
+            preCreated.entity.position = .zero
+            preCreated.entity.components.set(OpacityComponent(opacity: 0.0))
+            // Apply scale immediately if playerScreenSize is known (entity has been pre-warming)
+            if let vc = preCreated.entity.components[VideoPlayerComponent.self] {
+                let s = vc.playerScreenSize
+                if s.x > 0 && s.y > 0 {
+                    preCreated.entity.scale = SIMD3<Float>(repeating: windowFitScale(entityWidth: s.x, entityHeight: s.y))
+                }
+            }
+            incomingContentEntity.addChild(preCreated.entity)
+
+            // Start playback — player was paused during preload
+            preCreated.player.play()
+
+            incomingVideoPlayer = preCreated.player
+            incomingVideoEntity = preCreated.entity
+            incomingVideoStreamingLoader = preCreated.loader
+
+            print("📼 Using pre-warmed video entity for \(meta.id.prefix(8))...")
+            showLoading = false
+        } else if let asset = spatialPhotoManager.peekAsset(at: targetIndex) {
+            // Full asset data is cached — handle photos and video fallback
             if !asset.isVideo {
-                // Load photo into incoming entity
                 await loadPhotoIntoEntity(asset, entity: incomingContentEntity, initialOpacity: 0.0)
                 showLoading = false
             } else {
-                // Video - check for pre-created entity first (instant!)
-                if let preCreated = preCreatedVideoEntities[asset.assetId] {
-                    // Add to incomingContentEntity (same as photos, so it inherits all animations)
-                    preCreated.entity.position = .zero
-                    // Set initial opacity to 0 to prevent pop-in
-                    preCreated.entity.components.set(OpacityComponent(opacity: 0.0))
-                    if preCreated.entity.parent == nil {
-                        incomingContentEntity.addChild(preCreated.entity)
-                    }
-
-                    // Start playback immediately
-                    preCreated.player.play()
-
-                    // Store references for cleanup
-                    incomingVideoPlayer = preCreated.player
-                    incomingVideoEntity = preCreated.entity
-                    incomingVideoStreamingLoader = preCreated.loader
-
-                    print("📼 Using pre-created video entity for \(asset.assetId.prefix(8))...")
+                // Video with no pre-warmed entity — try pre-buffer fallback
+                let hasPreBuffer = spatialPhotoManager.getPreBufferedVideoInfo(assetId: asset.assetId) != nil
+                if hasPreBuffer {
+                    await prepareIncomingVideo(assetId: asset.assetId, direction: direction)
                     showLoading = false
                 } else {
-                    // Fallback: try to create on demand with pre-buffer
-                    let hasPreBuffer = spatialPhotoManager.getPreBufferedVideoInfo(assetId: asset.assetId) != nil
-                    if hasPreBuffer {
-                        await prepareIncomingVideo(assetId: asset.assetId, direction: direction)
-                        showLoading = false
-                    } else {
-                        showLoading = true
-                    }
+                    showLoading = true
                 }
             }
         } else {
             // Asset not cached yet
             showLoading = true
+        }
+
+        // Sync opacity + Z to current drag progress — content loaded at defaults but the
+        // drag handler won't fire again after this async load, leaving it invisible.
+        let currentProgress = min(1.0, abs(dragOffset) / 0.8)
+        // Videos: defer opacity reveal to the drag handler, which checks playerScreenSize
+        // before revealing. Showing a video at scale 1.0 (before playerScreenSize is known)
+        // causes a visible flash — the drag handler suppresses that.
+        if incomingVideoEntity == nil {
+            setIncomingContentOpacity(currentProgress)
+        }
+        let syncedZ: Float = -0.06 * (1.0 - currentProgress)
+        for child in incomingContentEntity.children {
+            child.position.z = syncedZ
         }
     }
 
@@ -721,8 +768,10 @@ struct SpatialPhotoImmersiveView: View {
 
         // Create video entity (add to incomingContentEntity like photos, so it inherits all animations)
         var videoComponent = VideoPlayerComponent(avPlayer: player)
-        videoComponent.desiredSpatialVideoMode = .spatial  // Always: RealityKit renders mono for non-spatial
         videoComponent.isPassthroughTintingEnabled = false
+        videoComponent.desiredViewingMode = .stereo
+        videoComponent.desiredSpatialVideoMode = .spatial
+        videoComponent.desiredImmersiveViewingMode = .portal
         let videoEntity = Entity()
         videoEntity.name = "incomingVideoEntity"
         videoEntity.components.set(videoComponent)
@@ -730,7 +779,8 @@ struct SpatialPhotoImmersiveView: View {
         videoEntity.components.set(HoverEffectComponent())
         videoEntity.position = .zero  // Relative to incomingContentEntity
 
-        // Add to incomingContentEntity (same as photos)
+        // Add to incomingContentEntity (same as photos), clearing any thumbnail placeholder first
+        incomingContentEntity.children.removeAll()
         incomingContentEntity.addChild(videoEntity)
 
         // Store references for cleanup
@@ -791,8 +841,12 @@ struct SpatialPhotoImmersiveView: View {
             let currentIndex = spatialPhotoManager.currentIndex
             let totalAssets = spatialPhotoManager.totalAssets
 
-            // Pre-create for previous and next videos (just 1 in each direction for now)
-            let indicesToCheck = [currentIndex - 1, currentIndex + 1].filter { $0 >= 0 && $0 < totalAssets }
+            // Pre-create for up to 3 adjacent videos in each direction
+            let indicesToCheck = (-3...3).compactMap { offset -> Int? in
+                guard offset != 0 else { return nil }
+                let idx = currentIndex + offset
+                return (idx >= 0 && idx < totalAssets) ? idx : nil
+            }
 
             for index in indicesToCheck {
                 guard !Task.isCancelled else { return }
@@ -843,26 +897,30 @@ struct SpatialPhotoImmersiveView: View {
                 let isSpatialVideo = spatialPhotoManager.isAssetKnownSpatial(asset.id)
                 print("📼 Pre-create: spatial=\(isSpatialVideo) for \(asset.id.prefix(8))")
 
-                // Create video entity (but don't add to scene yet)
-                // Use opacity 0.2 from the start to avoid flicker when enabling
                 var videoComponent = VideoPlayerComponent(avPlayer: player)
-                // Always request spatial mode: RealityKit applies it only when content supports it.
-                // This ensures spatial assets render correctly even when not yet in the cache.
-                videoComponent.desiredSpatialVideoMode = .spatial
                 videoComponent.isPassthroughTintingEnabled = false
+                videoComponent.desiredViewingMode = .stereo
+                videoComponent.desiredSpatialVideoMode = .spatial
+                videoComponent.desiredImmersiveViewingMode = .portal
                 let videoEntity = Entity()
                 videoEntity.name = "preCreatedVideoEntity_\(asset.id.prefix(8))"
                 videoEntity.components.set(videoComponent)
-                videoEntity.components.set(OpacityComponent(opacity: 0.2))
+                // opacity 0.001: imperceptible but non-zero forces RealityKit to actually
+                // render the entity and initialize the VideoPlayerComponent portal pipeline.
+                // opacity 0.0 causes RealityKit to skip rendering, leaving the portal
+                // uninitialized and causing a brief black flash when it first becomes visible.
+                videoEntity.components.set(OpacityComponent(opacity: 0.001))
                 videoEntity.components.set(HoverEffectComponent())
-                // Don't disable - just keep it out of scene until needed
 
-                // Store in cache
+                // Add to preloadEntity (in scene, paused) so VideoPlayerComponent initializes
+                // its render pipeline and decodes the first frame before the user swipes.
+                // Player stays paused — play() is called only when the entity becomes visible.
                 await MainActor.run {
+                    preloadEntity.addChild(videoEntity)
                     preCreatedVideoEntities[asset.id] = (player: player, entity: videoEntity, loader: loader)
                 }
 
-                print("📼 Pre-created video entity for \(asset.id.prefix(8))...")
+                print("📼 Pre-warmed video entity for \(asset.id.prefix(8))...")
             }
 
             // Clean up old cached entities that are no longer adjacent
@@ -908,6 +966,20 @@ struct SpatialPhotoImmersiveView: View {
             let remainingProgress = abs(capturedWrapperX - dynamicBasePosition.x) / slideDistance
             let remainingDuration = 0.35 * Double(1.0 - remainingProgress)  // Proportional duration
 
+            // Wait for content preparation to finish so the incoming entity has content
+            // before the fade-in animation starts — avoids pop-in at release.
+            await prepareIncomingTask?.value
+
+            // Scale incoming video to fit window before animation begins — video starts at
+            // scale 1.0 (natural portal size) and must be corrected before it becomes visible.
+            if let entity = incomingVideoEntity,
+               let vc = entity.components[VideoPlayerComponent.self] {
+                let s = vc.playerScreenSize
+                if s.x > 0 && s.y > 0 {
+                    entity.scale = SIMD3<Float>(repeating: windowFitScale(entityWidth: s.x, entityHeight: s.y))
+                }
+            }
+
             if remainingDuration > 0.005 {
                 await animateCarouselCompletion(
                     wrapperFromX: capturedWrapperX,
@@ -934,6 +1006,15 @@ struct SpatialPhotoImmersiveView: View {
                 videoPlayer = incomingPlayer
                 videoStreamingLoader = incomingVideoStreamingLoader
 
+                // Scale portal mesh to fit window using playerScreenSize
+                if let entity = sceneVideoEntity,
+                   let vc = entity.components[VideoPlayerComponent.self] {
+                    let s = vc.playerScreenSize
+                    if s.x > 0 && s.y > 0 {
+                        entity.scale = SIMD3<Float>(repeating: windowFitScale(entityWidth: s.x, entityHeight: s.y))
+                    }
+                }
+
                 // Setup time observer for the new video
                 setupVideoTimeObserver(for: incomingPlayer)
 
@@ -947,18 +1028,32 @@ struct SpatialPhotoImmersiveView: View {
 
             wrapperEntity.position = dynamicBasePosition
             incomingContentEntity.position = .zero
-            loadingEntity?.position = dynamicBasePosition
 
-            // If content was loaded (photo or video), ensure full opacity; otherwise wait for load
-            if !contentEntity.children.isEmpty || sceneVideoEntity != nil {
+            // For videos: only treat entity as real content when sceneVideoEntity is set
+            // (meaning a video player was properly transferred). If contentEntity has children
+            // but sceneVideoEntity is nil, those are thumbnail placeholders from preloadThumbnailIntoIncoming
+            // that should be replaced by the actual video load.
+            let currentIsVideo = spatialPhotoManager.currentAssetMetadata?.type == .VIDEO
+            let hasRealContent = sceneVideoEntity != nil || (!contentEntity.children.isEmpty && !currentIsVideo)
+
+            if hasRealContent {
                 setContentOpacity(1.0)
                 showLoading = false
+                updateMinWindowSize()
             } else {
+                // Video with only a thumbnail placeholder (no real entity), or no content at all.
+                // Clear the placeholder and load the actual asset.
+                contentEntity.children.removeAll()
+                showLoading = true
                 await waitAndDisplayAsset()
             }
 
             isAnimating = false
             dragOffset = 0
+
+            // Refresh preload cache so neighbors of the new current asset warm up
+            spatialPhotoManager.preBufferAdjacentVideos()
+            preCreateAdjacentVideoEntities()
         }
     }
 
@@ -974,13 +1069,8 @@ struct SpatialPhotoImmersiveView: View {
 
         let oldStartOpacity = getCurrentContentOpacity()
         let incomingStartOpacity = getIncomingContentOpacity()
-
-        // Get current Z offset of old content
         let oldContentStartZ = contentEntity.children.first?.position.z ?? 0
-        let oldContentTargetZ: Float = -0.4  // Full push back position
-
-        // Get current Z offset of incoming content
-        let incomingContentStartZ = incomingContentEntity.children.first?.position.z ?? -0.4
+        let incomingContentStartZ = incomingContentEntity.children.first?.position.z ?? -0.06
 
         for i in 1...steps {
             let progress = Float(i) / Float(steps)
@@ -988,26 +1078,13 @@ struct SpatialPhotoImmersiveView: View {
 
             wrapperEntity.position.x = wrapperFromX + deltaX * eased
 
-            // Continue Z animation on old content (pushes back as it slides out)
-            // Videos are now in contentEntity, so this handles both photos and videos
-            let currentZ = oldContentStartZ + (oldContentTargetZ - oldContentStartZ) * eased
-            for child in contentEntity.children {
-                child.position.z = currentZ
-            }
-
-            // Animate incoming Z (comes forward from pushed back to 0)
-            let incomingZ = incomingContentStartZ * (1 - eased)
-            for child in incomingContentEntity.children {
-                child.position.z = incomingZ
-            }
-
-            // Fade out old, fade in new (setContentOpacity handles both photos and videos now)
+            // Fade + subtle Z: outgoing pushes back, incoming comes forward.
             setContentOpacity(oldStartOpacity * (1 - eased))
             setIncomingContentOpacity(min(1.0, incomingStartOpacity + (1.0 - incomingStartOpacity) * eased))
-
-            // Update loading position toward center
-            let incomingWorldX = dynamicBasePosition.x + incomingContentEntity.position.x + (wrapperFromX - dynamicBasePosition.x + deltaX * eased)
-            loadingEntity?.position.x = dynamicBasePosition.x * eased + incomingWorldX * (1 - eased)
+            let outgoingZ = oldContentStartZ + (-0.06 - oldContentStartZ) * eased
+            for child in contentEntity.children { child.position.z = outgoingZ }
+            let incomingZ = incomingContentStartZ * (1 - eased)
+            for child in incomingContentEntity.children { child.position.z = incomingZ }
 
             try? await Task.sleep(for: .milliseconds(Int(stepDuration * 1000)))
         }
@@ -1015,10 +1092,7 @@ struct SpatialPhotoImmersiveView: View {
         wrapperEntity.position.x = wrapperToX
         setContentOpacity(0)
         setIncomingContentOpacity(1.0)
-        // Ensure incoming Z is at 0
-        for child in incomingContentEntity.children {
-            child.position.z = 0
-        }
+        for child in incomingContentEntity.children { child.position.z = 0 }
     }
 
     /// Get current opacity of incoming content
@@ -1083,31 +1157,19 @@ struct SpatialPhotoImmersiveView: View {
 
         let startOpacity = getCurrentContentOpacity()
         let deltaOpacity = 1.0 - startOpacity
-
-        // Get current Z offset of content (to animate back to 0)
         let contentStartZ = contentEntity.children.first?.position.z ?? 0
 
         for i in 1...steps {
             let progress = Float(i) / Float(steps)
-            // Ease-out curve - starts fast, slows at end
             let eased = 1 - pow(1 - progress, 3)
 
-            let newX = fromX + deltaX * eased
-            wrapperEntity.position.x = newX
-
-            // Animate content Z back to 0 (applies to both photos and videos)
-            let contentZ = contentStartZ * (1 - eased)
-            for child in contentEntity.children {
-                child.position.z = contentZ
-            }
-
-            // Sync loading entity
-            loadingEntity?.position.x = newX
-
-            // Restore old content opacity
+            wrapperEntity.position.x = fromX + deltaX * eased
             setContentOpacity(startOpacity + deltaOpacity * eased)
 
-            // Fade out any incoming content that was visible — prevents instant pop on removal
+            // Restore outgoing content Z back to 0
+            let contentZ = contentStartZ * (1 - eased)
+            for child in contentEntity.children { child.position.z = contentZ }
+
             if incomingStartOpacity > 0 {
                 setIncomingContentOpacity(incomingStartOpacity * (1 - eased))
             }
@@ -1115,13 +1177,9 @@ struct SpatialPhotoImmersiveView: View {
             try? await Task.sleep(for: .milliseconds(Int(stepDuration * 1000)))
         }
 
-        // Ensure final positions and opacities
         wrapperEntity.position.x = targetX
-        for child in contentEntity.children {
-            child.position.z = 0
-        }
-        loadingEntity?.position.x = targetX
         setContentOpacity(1.0)
+        for child in contentEntity.children { child.position.z = 0 }
         if incomingStartOpacity > 0 {
             setIncomingContentOpacity(0)
         }
@@ -1223,12 +1281,10 @@ struct SpatialPhotoImmersiveView: View {
             // Update X position (video inherits from contentEntity which is child of wrapper)
             let newX = startX + deltaX * eased
             wrapperEntity.position.x = newX
-            loadingEntity?.position.x = newX
 
             // Update Z position
             let newZ = startZ + deltaZ * eased
             wrapperEntity.position.z = newZ
-            loadingEntity?.position.z = newZ
 
             // Update opacity on content children (includes both photos and videos)
             let currentOpacity = startOpacity + deltaOpacity * eased
@@ -1239,8 +1295,6 @@ struct SpatialPhotoImmersiveView: View {
 
         wrapperEntity.position.x = toX
         wrapperEntity.position.z = toZ
-        loadingEntity?.position.x = toX
-        loadingEntity?.position.z = toZ
         setContentOpacity(toOpacity)
     }
 
@@ -1270,12 +1324,6 @@ struct SpatialPhotoImmersiveView: View {
             videoEntity.components.set(opacityComponent)
         }
 
-        // Also apply opacity to the loading attachment so it fades during swipes
-        if let loading = loadingEntity {
-            var opacityComponent = loading.components[OpacityComponent.self] ?? OpacityComponent(opacity: 1.0)
-            opacityComponent.opacity = opacity
-            loading.components.set(opacityComponent)
-        }
     }
 
     // MARK: - Asset Display
@@ -1295,9 +1343,13 @@ struct SpatialPhotoImmersiveView: View {
             return
         }
 
+        // Restore input target in case it was removed during idle cleanup
+        if wrapperEntity.components[InputTargetComponent.self] == nil {
+            wrapperEntity.components.set(InputTargetComponent(allowedInputTypes: .indirect))
+        }
+
         contentEntity.children.removeAll()
         wrapperEntity.position = dynamicBasePosition  // Reset wrapper position
-        loadingEntity?.position = dynamicBasePosition  // Sync loading with wrapper
         dragOffset = 0
 
         // Only show loading if asset isn't already cached
@@ -1383,33 +1435,30 @@ struct SpatialPhotoImmersiveView: View {
 
             var component = try await ImagePresentationComponent(contentsOf: tempURL)
 
-            // Debug: Log available viewing modes
             print("🖼️ Available viewing modes: \(component.availableViewingModes)")
 
-            // Use spatialStereoImmersive for blurry edge effect (requires ImmersiveSpace)
-            if component.availableViewingModes.contains(.spatialStereoImmersive) {
-                component.desiredViewingMode = .spatialStereoImmersive
-                print("🖼️ Using spatialStereoImmersive viewing mode (blurry edges)")
-            } else if component.availableViewingModes.contains(.spatialStereo) {
+            // In a volumetric window, use spatialStereo — creates the portal/window-frame depth effect.
+            // spatialStereoImmersive requires an ImmersiveSpace and won't render correctly here.
+            if component.availableViewingModes.contains(.spatialStereo) {
                 component.desiredViewingMode = .spatialStereo
-                print("🖼️ Using spatialStereo viewing mode (fallback)")
+                print("🖼️ Using spatialStereo viewing mode (portal depth)")
             }
 
             let photoEntity = Entity()
-
-            // Set opacity BEFORE adding the ImagePresentationComponent
-            // to ensure the entity is at full opacity when the image renders
-            photoEntity.components.set(OpacityComponent(opacity: initialOpacity))
-
-            // Add visionOS-style hover highlight effect (rim lighting)
             photoEntity.components.set(HoverEffectComponent())
-
-            // Add to scene BEFORE setting the image component
-            // This ensures the entity is ready when the image starts rendering
             contentEntity.addChild(photoEntity)
-
-            // Now set the image component - it should render at the entity's current opacity
+            // Set ImagePresentationComponent BEFORE opacity 0 — the component won't compute
+            // geometry bounds if opacity is already 0 when it initializes.
             photoEntity.components.set(component)
+            // Hide immediately so the unscaled entity isn't visible during the bounds wait.
+            photoEntity.components.set(OpacityComponent(opacity: 0.0))
+
+            // Wait one render cycle for the component to set entity bounds, then scale to fit
+            try? await Task.sleep(for: .milliseconds(50))
+            let b = photoEntity.visualBounds(relativeTo: contentEntity)
+            photoEntity.scale = SIMD3<Float>(repeating: windowFitScale(entityWidth: b.extents.x, entityHeight: b.extents.y))
+            photoEntity.components.set(OpacityComponent(opacity: initialOpacity))
+            updateMinWindowSize()
 
             // Cleanup temp file
             Task {
@@ -1621,8 +1670,8 @@ struct SpatialPhotoImmersiveView: View {
             spatialPhotoManager.markCurrentAssetAsSpatial()
         }
 
-        // Setup video entity — isSpatialVideo: true always requests spatial mode
-        await setupVideoPlayer(player, initialOpacity: initialOpacity, isSpatialVideo: true, targetPosition: targetPosition)
+        // Setup video entity hidden — reveal atomically with spinner dismiss to prevent first-frame flash
+        await setupVideoPlayer(player, initialOpacity: 0.0, isSpatialVideo: true, targetPosition: targetPosition)
 
         // For uncached assets: detect in a fully detached background task (no main actor,
         // separate HTTPS AVURLAsset with no VideoStreamingLoader involvement) purely for
@@ -1661,7 +1710,6 @@ struct SpatialPhotoImmersiveView: View {
         }
 
         // Wait for video to actually start rendering (currentTime > 0)
-        // Keep loading indicator visible until video pixels are on screen
         for _ in 0..<100 {  // Check up to 100 times (5 seconds max)
             try? await Task.sleep(for: .milliseconds(50))
             if player.currentTime().seconds > 0.02 {
@@ -1671,7 +1719,20 @@ struct SpatialPhotoImmersiveView: View {
             }
         }
 
-        // NOW hide the loading indicator (video should be visible)
+        // Scale portal mesh to fit window using playerScreenSize (the intended sizing API for
+        // VideoPlayerComponent — reflects actual portal mesh dimensions in meters).
+        if let entity = sceneVideoEntity,
+           let vc = entity.components[VideoPlayerComponent.self] {
+            let s = vc.playerScreenSize
+            if s.x > 0 && s.y > 0 {
+                let scale = windowFitScale(entityWidth: s.x, entityHeight: s.y)
+                entity.scale = SIMD3<Float>(repeating: scale)
+                print("📼 Video scaled via playerScreenSize \(String(format: "%.2f", s.x))×\(String(format: "%.2f", s.y))m → scale \(String(format: "%.2f", scale))")
+            }
+        }
+        updateMinWindowSize()
+
+        sceneVideoEntity?.components.set(OpacityComponent(opacity: initialOpacity))
         showLoading = false
 
         print("✅ Video streaming complete")
@@ -1732,7 +1793,8 @@ struct SpatialPhotoImmersiveView: View {
                 spatialPhotoManager.markCurrentAssetAsSpatial()
             }
 
-            await setupVideoPlayer(player, initialOpacity: initialOpacity, isSpatialVideo: isSpatialVideo, targetPosition: targetPosition)
+            // Setup video entity hidden — reveal atomically with spinner dismiss to prevent first-frame flash
+            await setupVideoPlayer(player, initialOpacity: 0.0, isSpatialVideo: isSpatialVideo, targetPosition: targetPosition)
 
             // Wait for video to actually start rendering
             for _ in 0..<100 {
@@ -1743,7 +1805,7 @@ struct SpatialPhotoImmersiveView: View {
                 }
             }
 
-            // NOW hide the loading indicator
+            sceneVideoEntity?.components.set(OpacityComponent(opacity: initialOpacity))
             showLoading = false
 
             // Clean up temp file when video ends
@@ -1810,17 +1872,11 @@ struct SpatialPhotoImmersiveView: View {
         print("📼 dynamicBasePosition: \(dynamicBasePosition)")
         print("📼 wrapperEntity.position: \(wrapperEntity.position)")
 
-        // Use VideoPlayerComponent for both spatial and non-spatial videos
-        // This gives us proper visionOS native video presentation with styling
         var videoComponent = VideoPlayerComponent(avPlayer: player)
-
-        if isSpatialVideo {
-            // Use spatial mode for immersive presentation with blurry edges
-            videoComponent.desiredSpatialVideoMode = .spatial
-        }
-
-        // Disable passthrough tinting for cleaner appearance
         videoComponent.isPassthroughTintingEnabled = false
+        videoComponent.desiredViewingMode = .stereo
+        videoComponent.desiredSpatialVideoMode = .spatial
+        videoComponent.desiredImmersiveViewingMode = .portal
 
         let videoEntity = Entity()
         videoEntity.name = "videoEntity"
@@ -1831,8 +1887,6 @@ struct SpatialPhotoImmersiveView: View {
         // Remove any previous scene-level video entity
         sceneVideoEntity?.removeFromParent()
 
-        // Add video to contentEntity (same as photos) so it inherits all wrapper animations
-        // Position at origin relative to contentEntity (wrapper handles world positioning)
         videoEntity.position = .zero
         contentEntity.addChild(videoEntity)
         sceneVideoEntity = videoEntity  // Track for cleanup and playback control
@@ -1856,6 +1910,7 @@ struct SpatialPhotoImmersiveView: View {
 
         print("📼 Video player setup complete")
     }
+
 
     // MARK: - Helpers
 
@@ -2046,9 +2101,8 @@ struct SpatialPhotoImmersiveView: View {
             // Reload the new current asset
             await displayCurrentAsset()
         } else {
-            // No assets left, dismiss viewer
-            await dismissImmersiveSpace()
             spatialPhotoManager.clear()
+            dismissWindow(id: "photoViewer")
         }
     }
 
@@ -2158,10 +2212,8 @@ struct SpatialPhotoImmersiveView: View {
 
             isPreparingShare = false
 
-            // Switch back to album view to show share sheet
-            // Main window is already open but hidden, just dismiss immersive space
             spatialPhotoManager.clear()
-            await dismissImmersiveSpace()
+            dismissWindow(id: "photoViewer")
 
         } catch {
             isPreparingShare = false
@@ -2169,139 +2221,97 @@ struct SpatialPhotoImmersiveView: View {
         }
     }
 
+    // MARK: - Content Scaling
+
+    /// Re-scale the currently displayed entity to fit the updated window size.
+    /// Called every frame during window resize via onChange(of: windowSize).
+    private func rescaleCurrentEntity() {
+        // Videos: playerScreenSize is always the unscaled portal mesh size
+        if let entity = sceneVideoEntity,
+           let vc = entity.components[VideoPlayerComponent.self] {
+            let s = vc.playerScreenSize
+            if s.x > 0 && s.y > 0 {
+                entity.scale = SIMD3<Float>(repeating: windowFitScale(entityWidth: s.x, entityHeight: s.y))
+            }
+            return
+        }
+
+        // Photos: reverse natural size from current scale + current bounds
+        for child in contentEntity.children {
+            let cs = child.scale.x
+            guard cs > 0 else { continue }
+            let b = child.visualBounds(relativeTo: contentEntity)
+            let nw = b.extents.x / cs
+            let nh = b.extents.y / cs
+            if nw > 0 && nh > 0 {
+                child.scale = SIMD3<Float>(repeating: windowFitScale(entityWidth: nw, entityHeight: nh))
+            }
+        }
+    }
+
+    /// Update the minimum window size to match the current entity's display size.
+    /// Called after each asset loads so the window can never clip the entity.
+    private func updateMinWindowSize() {
+        // Videos: display size = playerScreenSize × scale
+        if let entity = sceneVideoEntity,
+           let vc = entity.components[VideoPlayerComponent.self] {
+            let s = vc.playerScreenSize
+            let scale = entity.scale.x
+            let w = CGFloat(s.x * scale) * 1000
+            let h = CGFloat(s.y * scale) * 1000
+            if w > 0 && h > 0 {
+                minWindowSize = CGSize(width: w, height: h)
+            }
+            return
+        }
+        // Photos: visualBounds already reflects scale (in contentEntity space = meters)
+        for child in contentEntity.children {
+            let b = child.visualBounds(relativeTo: contentEntity)
+            if b.extents.x > 0 && b.extents.y > 0 {
+                minWindowSize = CGSize(
+                    width: CGFloat(b.extents.x) * 1000,
+                    height: CGFloat(b.extents.y) * 1000
+                )
+                return
+            }
+        }
+    }
+
+    /// Scale an entity so it fills 80% of the window, maintaining aspect ratio.
+    /// entityWidth/entityHeight are in RealityKit meters (the entity's natural rendered size).
+    /// The window's pt dimensions map to meters at 1pt = 0.001m.
+    private func windowFitScale(entityWidth: Float, entityHeight: Float) -> Float {
+        guard entityWidth > 0 && entityHeight > 0 else { return 1.0 }
+        let maxW = Float(windowSize.width) * 0.001 * 0.8
+        let maxH = Float(windowSize.height - 120) * 0.001 * 0.8
+        return min(maxW / entityWidth, maxH / entityHeight)
+    }
+
     // MARK: - Head Tracking
 
     private func getHeadBasedPosition() async -> SIMD3<Float> {
-        // For immersive space, position content at eye level in world coordinates
-        // Y = 0 is floor level, Y = 1.1 is comfortable eye level
-        // Z = -1.5 places content about 1.5 meters in front of the user
-        let immersivePosition: SIMD3<Float> = [0, 1.1, -1.5]
-        print("📦 Using immersive space position: \(immersivePosition)")
-        return immersivePosition
+        // Push content behind the window plane. Extra depth keeps the spatialStereo
+        // portal effect from visually overlapping the system movement bar at z=0.
+        return [0, 0, -0.20]
     }
 }
 
 // MARK: - Loading Placeholder View
 
 struct LoadingPlaceholderView: View {
-    @ObservedObject var spatialPhotoManager: SpatialPhotoManager
     let isVisible: Bool
 
-    // Base width in points for SwiftUI attachments (~0.8m in world space)
-    private let baseWidth: CGFloat = 800
-
-    private var baseHeight: CGFloat {
-        baseWidth * 0.75
-    }
-
     var body: some View {
-        // Use simple spinner for all content types to avoid size mismatch
-        // between loading placeholder and actual rendered content
-        spatialLoadingIndicator
+        ProgressView()
+            .scaleEffect(1.5)
+            .tint(.white)
+            .frame(width: 120, height: 120)
+            .background(.ultraThinMaterial)
+            .clipShape(RoundedRectangle(cornerRadius: 24))
             .opacity(isVisible ? 1.0 : 0.0)
             .animation(.easeInOut(duration: 0.05), value: isVisible)
     }
 
-    /// Check if the content is spatial (from spatial cache, metadata, or loaded asset)
-    private func isSpatialContent(metadata: Asset) -> Bool {
-        // Check spatial cache first (most reliable - pre-scanned)
-        if spatialPhotoManager.isCurrentAssetKnownSpatial { return true }
-
-        // Check metadata flag
-        if metadata.isSpatial { return true }
-
-        // Check loaded asset
-        if spatialPhotoManager.currentAsset?.isSpatial == true { return true }
-
-        // For videos, check projection type for spatial indicators
-        if metadata.type == .VIDEO {
-            if let projection = metadata.projectionType, !projection.isEmpty {
-                return true
-            }
-        }
-
-        return false
-    }
-
-    /// Simple loading indicator for spatial photos/videos
-    private var spatialLoadingIndicator: some View {
-        ProgressView()
-            .scaleEffect(1.5)
-            .tint(.white)
-            .frame(width: 100, height: 100)
-            .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: 20))
-    }
-
-    /// Sized placeholder for regular photos/videos
-    private func regularLoadingPlaceholder(metadata: Asset) -> some View {
-        // Use thumbnail's actual aspect ratio if available, otherwise fall back to metadata
-        let aspectRatio = spatialPhotoManager.currentThumbnailAspectRatio ?? metadata.ratio ?? (4.0/3.0)
-        let size = calculateSizeFromRatio(aspectRatio)
-
-        return ZStack {
-            // Background with thumbnail if available
-            if let thumbnail = spatialPhotoManager.currentThumbnail {
-                // Show thumbnail scaled to match final asset dimensions
-                // Use interpolation to scale up the small thumbnail smoothly
-                Image(decorative: thumbnail, scale: 1.0)
-                    .resizable(resizingMode: .stretch)
-                    .interpolation(.high)
-                    .aspectRatio(contentMode: .fill)
-                    .frame(width: size.width, height: size.height)
-                    .clipped()
-                    .blur(radius: 12)  // Heavy blur for loading state
-                    .clipShape(RoundedRectangle(cornerRadius: 20))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 20)
-                            .fill(.black.opacity(0.3))
-                    }
-            } else {
-                // Glass placeholder when no thumbnail
-                RoundedRectangle(cornerRadius: 20)
-                    .fill(.ultraThinMaterial)
-                    .frame(width: size.width, height: size.height)
-            }
-
-            // Simple spinner overlay
-            ProgressView()
-                .scaleEffect(1.5)
-                .tint(.white)
-        }
-    }
-
-    /// Default loading window when no metadata available
-    private var defaultLoadingPlaceholder: some View {
-        VStack(spacing: 16) {
-            ProgressView()
-                .scaleEffect(1.5)
-                .tint(.white)
-
-            Text("Loading")
-                .font(.system(size: 16, weight: .medium))
-                .foregroundStyle(.white.opacity(0.8))
-        }
-        .padding(32)
-        .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 20))
-        .glassBackgroundEffect()
-    }
-
-    /// Calculate placeholder size from aspect ratio
-    /// Uses the base width and calculates height from the ratio
-    private func calculateSizeFromRatio(_ ratio: Double) -> CGSize {
-        guard ratio > 0 else {
-            print("📐 Invalid ratio, using default size: \(baseWidth)x\(baseHeight)")
-            return CGSize(width: baseWidth, height: baseHeight)
-        }
-
-        // ratio is width/height, so height = width / ratio
-        let width = baseWidth
-        let height = baseWidth / CGFloat(ratio)
-
-        print("📐 Placeholder size: \(Int(width))x\(Int(height)) (ratio: \(String(format: "%.2f", ratio)))")
-        return CGSize(width: width, height: height)
-    }
 }
 
 // MARK: - Asset Info Panel View

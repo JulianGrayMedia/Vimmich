@@ -22,7 +22,7 @@ struct CollectionsView: View {
     @State private var memories: [Memory] = []
     @State private var isLoadingMemories = false
 
-    @Environment(\.openImmersiveSpace) var openImmersiveSpace
+    @Environment(\.openWindow) var openWindow
 
     let columns = Array(repeating: GridItem(.flexible(), spacing: 16), count: 5)
 
@@ -236,7 +236,7 @@ struct CollectionsView: View {
             ),
             spatialCache: spatialCache
         )
-        await openImmersiveSpace(id: "SpatialPhotoViewer")
+        openWindow(id: "photoViewer")
     }
 
     private func loadThumbnails() async {

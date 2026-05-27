@@ -53,14 +53,18 @@ class ShareManager: ObservableObject {
 
 @main
 struct ImmichVisionProClientApp: App {
+    @StateObject private var api = ImmichAPI()
     @StateObject private var spatialPhotoManager = SpatialPhotoManager()
     @StateObject private var spatialCache = SpatialAssetCache()
     @StateObject private var shareManager = ShareManager()
+    @AppStorage("mainWindowWidth") private var mainWindowWidth: Double = 1280
+    @AppStorage("mainWindowHeight") private var mainWindowHeight: Double = 720
 
     var body: some Scene {
         // Main window for album browsing
         WindowGroup(id: "main") {
             ContentView()
+                .environmentObject(api)
                 .environmentObject(spatialPhotoManager)
                 .environmentObject(spatialCache)
                 .environmentObject(shareManager)
@@ -69,16 +73,27 @@ struct ImmichVisionProClientApp: App {
                 .animation(.easeInOut(duration: 0.05), value: spatialPhotoManager.isRestoringScrollPosition)
                 .allowsHitTesting(!spatialPhotoManager.isDisplaying)
                 .persistentSystemOverlays(spatialPhotoManager.isDisplaying ? .hidden : .automatic)
+                .background(GeometryReader { geo in
+                    Color.clear
+                        .onAppear { mainWindowWidth = geo.size.width; mainWindowHeight = geo.size.height }
+                        .onChange(of: geo.size) { _, s in mainWindowWidth = s.width; mainWindowHeight = s.height }
+                })
         }
         .windowStyle(.plain)
 
-        // Immersive space for spatial photo viewing (borderless, no environments)
-        ImmersiveSpace(id: "SpatialPhotoViewer") {
+        // Photo/video viewer — plain window, resizes to match image aspect ratio.
+        // Never dismissed — just cleared and made idle so it retains its position.
+        // Window (not WindowGroup) ensures only one instance; openWindow focuses rather than spawning a second.
+        Window("Photo Viewer", id: "photoViewer") {
             SpatialPhotoImmersiveView()
                 .environmentObject(spatialPhotoManager)
                 .environmentObject(spatialCache)
                 .environmentObject(shareManager)
         }
-        .immersionStyle(selection: .constant(.mixed), in: .mixed)
+        .windowStyle(.plain)
+        .windowResizability(.contentMinSize)
+        .defaultWindowPlacement { _, _ in
+            WindowPlacement(size: CGSize(width: 3000, height: 2000))
+        }
     }
 }
