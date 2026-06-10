@@ -18,7 +18,7 @@ struct SpatialPhotoImmersiveView: View {
     @Environment(\.dismissWindow) var dismissWindow
     @Environment(\.openWindow) var openWindow
 
-    // Wrapper entity for movement (has collision for gesture)
+    // Wrapper entity for movement during carousel drag transitions
     @State private var wrapperEntity: Entity = Entity()
 
     // Content entity that holds the displayed asset (child of wrapper)
@@ -32,6 +32,7 @@ struct SpatialPhotoImmersiveView: View {
     @State private var isDragging: Bool = false
     @State private var dragDirection: Int = 0  // -1 = left (next), +1 = right (previous), 0 = undetermined
     @State private var incomingPrepared: Bool = false
+    @State private var incomingPhotoScaled: Bool = true
     @State private var prepareIncomingTask: Task<Void, Never>? = nil
 
     // Loading state - starts false, enabled after wrapper is positioned
@@ -107,10 +108,20 @@ struct SpatialPhotoImmersiveView: View {
             wrapperEntity.name = "wrapperEntity"
             wrapperEntity.position = initialPosition
 
-            // Add collision to wrapper for gesture detection
-            let shape = ShapeResource.generateBox(width: 2.0, height: 1.5, depth: 0.1)
-            wrapperEntity.components.set(CollisionComponent(shapes: [shape]))
-            wrapperEntity.components.set(InputTargetComponent(allowedInputTypes: .indirect))
+            // Indirect-input target lives on a CHILD entity offset upward from the wrapper.
+            // The wrapper itself sits at world Y = -0.15 (where the photo is centered), but
+            // its 2D-projected silhouette extended below the window's bottom edge into the
+            // ornament's hit region — that's what was hijacking pinches meant for the buttons.
+            // Offsetting upward by 0.25m (and shrinking the box height) lifts the projection
+            // well clear of the ornament while still covering the central/upper photo area
+            // where users actually look to swipe and tap.
+            let gestureTargetEntity = Entity()
+            gestureTargetEntity.name = "gestureTarget"
+            gestureTargetEntity.position = SIMD3<Float>(0, 0.25, 0)
+            let shape = ShapeResource.generateBox(width: 2.0, height: 1.0, depth: 0.1)
+            gestureTargetEntity.components.set(CollisionComponent(shapes: [shape]))
+            gestureTargetEntity.components.set(InputTargetComponent(allowedInputTypes: .indirect))
+            wrapperEntity.addChild(gestureTargetEntity)
 
             // Content entity is a child of wrapper (position relative to wrapper = origin)
             contentEntity.name = "contentEntity"
@@ -160,6 +171,39 @@ struct SpatialPhotoImmersiveView: View {
         } attachments: {
             Attachment(id: "loadingIndicator") {
                 LoadingPlaceholderView(isVisible: showLoading)
+            }
+        }
+        .ornament(attachmentAnchor: .scene(.bottom)) {
+            VStack(spacing: 0) {
+                if spatialPhotoManager.currentAsset?.isVideo == true && videoDuration > 0 {
+                    VideoTimelineView(
+                        currentTime: $videoCurrentTime,
+                        duration: videoDuration,
+                        isPlaying: isVideoPlaying,
+                        isSeeking: $isSeeking,
+                        onSeek: { seekVideo(to: $0) },
+                        onPlayPause: { toggleVideoPlayback() },
+                        onInteraction: { showControlsTemporarily() }
+                    )
+                    .opacity(showControls ? 1 : 0)
+                    .animation(.easeInOut(duration: 0.25), value: showControls)
+                    .allowsHitTesting(showControls)
+                }
+                ControlsContentView(
+                    spatialPhotoManager: spatialPhotoManager,
+                    showInfoPanel: $showInfoPanel,
+                    isPreparingShare: isPreparingShare,
+                    isCurrentAssetBeingSaved: isCurrentAssetBeingSaved,
+                    showControls: showControls,
+                    onNavigatePrevious: { navigatePrevious() },
+                    onNavigateNext: { navigateNext() },
+                    onShowControlsTemporarily: { showControlsTemporarily() },
+                    onPrepareAndShare: { Task { await prepareAndShare() } },
+                    onHideAsset: { Task { await hideCurrentAsset() } },
+                    onSaveOffline: { Task { let _ = await spatialPhotoManager.saveCurrentAssetOffline() } },
+                    onDismiss: { spatialPhotoManager.clear(); dismissWindow(id: "photoViewer") },
+                    formatBytes: formatBytes
+                )
             }
         }
         .frame(minWidth: minWindowSize.width, minHeight: minWindowSize.height)
@@ -255,7 +299,7 @@ struct SpatialPhotoImmersiveView: View {
                                 setIncomingContentOpacity(incomingOpacity)
                             }
                             // playerScreenSize still zero — keep entity hidden this frame
-                        } else {
+                        } else if incomingPhotoScaled {
                             setIncomingContentOpacity(incomingOpacity)
                         }
                         let incomingZ: Float = -0.06 * (1.0 - incomingOpacity)
@@ -292,7 +336,7 @@ struct SpatialPhotoImmersiveView: View {
         )
         .gesture(
             TapGesture()
-                .targetedToEntity(wrapperEntity)
+                .targetedToAnyEntity()
                 .onEnded { _ in
                     toggleControls()
                 }
@@ -345,7 +389,6 @@ struct SpatialPhotoImmersiveView: View {
                 showInfoPanel = false
                 hideControlsTask?.cancel()
                 cleanupVideoObserver()
-                wrapperEntity.components.remove(InputTargetComponent.self)
             }
         }
         .onDisappear {
@@ -354,39 +397,6 @@ struct SpatialPhotoImmersiveView: View {
             spatialPhotoManager.clear()
             hideControlsTask?.cancel()
             cleanupVideoObserver()
-        }
-        .ornament(attachmentAnchor: .scene(.bottom)) {
-            VStack(spacing: 0) {
-                if spatialPhotoManager.currentAsset?.isVideo == true && videoDuration > 0 {
-                    VideoTimelineView(
-                        currentTime: $videoCurrentTime,
-                        duration: videoDuration,
-                        isPlaying: isVideoPlaying,
-                        isSeeking: $isSeeking,
-                        onSeek: { seekVideo(to: $0) },
-                        onPlayPause: { toggleVideoPlayback() },
-                        onInteraction: { showControlsTemporarily() }
-                    )
-                    .opacity(showControls ? 1 : 0)
-                    .animation(.easeInOut(duration: 0.25), value: showControls)
-                    .allowsHitTesting(showControls)
-                }
-                ControlsContentView(
-                    spatialPhotoManager: spatialPhotoManager,
-                    showInfoPanel: $showInfoPanel,
-                    isPreparingShare: isPreparingShare,
-                    isCurrentAssetBeingSaved: isCurrentAssetBeingSaved,
-                    showControls: showControls,
-                    onNavigatePrevious: { navigatePrevious() },
-                    onNavigateNext: { navigateNext() },
-                    onShowControlsTemporarily: { showControlsTemporarily() },
-                    onPrepareAndShare: { Task { await prepareAndShare() } },
-                    onHideAsset: { Task { await hideCurrentAsset() } },
-                    onSaveOffline: { Task { let _ = await spatialPhotoManager.saveCurrentAssetOffline() } },
-                    onDismiss: { spatialPhotoManager.clear(); dismissWindow(id: "photoViewer") },
-                    formatBytes: formatBytes
-                )
-            }
         }
     }
 
@@ -554,11 +564,26 @@ struct SpatialPhotoImmersiveView: View {
             guard !Task.isCancelled else { return }
 
             let photoEntity = Entity()
-            photoEntity.components.set(HoverEffectComponent())
+            // Configure all components before addChild so the entity enters the scene already
+            // invisible — RealityKit's render thread runs independently and can fire between
+            // statements, so addChild must happen last to prevent a full-scale flash.
+            photoEntity.components.set(component)
+            photoEntity.components.remove(HoverEffectComponent.self)
+            photoEntity.components.remove(InputTargetComponent.self)
+            photoEntity.components.remove(CollisionComponent.self)
+            photoEntity.components.set(OpacityComponent(opacity: 0.0))
 
+            incomingPhotoScaled = false
             entity.children.removeAll()
             entity.addChild(photoEntity)
-            photoEntity.components.set(component)
+
+            try? await Task.sleep(for: .milliseconds(50))
+            guard photoEntity.parent != nil, !Task.isCancelled else { return }
+            let b = photoEntity.visualBounds(relativeTo: entity)
+            if b.extents.x > 0 && b.extents.y > 0 {
+                photoEntity.scale = SIMD3<Float>(repeating: windowFitScale(entityWidth: b.extents.x, entityHeight: b.extents.y))
+            }
+            incomingPhotoScaled = true
             photoEntity.components.set(OpacityComponent(opacity: initialOpacity))
 
             // Cleanup temp file
@@ -775,8 +800,10 @@ struct SpatialPhotoImmersiveView: View {
         let videoEntity = Entity()
         videoEntity.name = "incomingVideoEntity"
         videoEntity.components.set(videoComponent)
+        videoEntity.components.remove(HoverEffectComponent.self)
+        videoEntity.components.remove(InputTargetComponent.self)
+        videoEntity.components.remove(CollisionComponent.self)
         videoEntity.components.set(OpacityComponent(opacity: 0.0))  // Start at 0, will fade in during drag
-        videoEntity.components.set(HoverEffectComponent())
         videoEntity.position = .zero  // Relative to incomingContentEntity
 
         // Add to incomingContentEntity (same as photos), clearing any thumbnail placeholder first
@@ -905,12 +932,14 @@ struct SpatialPhotoImmersiveView: View {
                 let videoEntity = Entity()
                 videoEntity.name = "preCreatedVideoEntity_\(asset.id.prefix(8))"
                 videoEntity.components.set(videoComponent)
+                videoEntity.components.remove(HoverEffectComponent.self)
+                videoEntity.components.remove(InputTargetComponent.self)
+                videoEntity.components.remove(CollisionComponent.self)
                 // opacity 0.001: imperceptible but non-zero forces RealityKit to actually
                 // render the entity and initialize the VideoPlayerComponent portal pipeline.
                 // opacity 0.0 causes RealityKit to skip rendering, leaving the portal
                 // uninitialized and causing a brief black flash when it first becomes visible.
                 videoEntity.components.set(OpacityComponent(opacity: 0.001))
-                videoEntity.components.set(HoverEffectComponent())
 
                 // Add to preloadEntity (in scene, paused) so VideoPlayerComponent initializes
                 // its render pipeline and decodes the first frame before the user swipes.
@@ -1343,11 +1372,6 @@ struct SpatialPhotoImmersiveView: View {
             return
         }
 
-        // Restore input target in case it was removed during idle cleanup
-        if wrapperEntity.components[InputTargetComponent.self] == nil {
-            wrapperEntity.components.set(InputTargetComponent(allowedInputTypes: .indirect))
-        }
-
         contentEntity.children.removeAll()
         wrapperEntity.position = dynamicBasePosition  // Reset wrapper position
         dragOffset = 0
@@ -1445,13 +1469,14 @@ struct SpatialPhotoImmersiveView: View {
             }
 
             let photoEntity = Entity()
-            photoEntity.components.set(HoverEffectComponent())
-            contentEntity.addChild(photoEntity)
-            // Set ImagePresentationComponent BEFORE opacity 0 — the component won't compute
-            // geometry bounds if opacity is already 0 when it initializes.
+            // Configure all components before addChild — entity enters the scene already
+            // invisible so RealityKit's render thread can never flash it at full scale.
             photoEntity.components.set(component)
-            // Hide immediately so the unscaled entity isn't visible during the bounds wait.
+            photoEntity.components.remove(HoverEffectComponent.self)
+            photoEntity.components.remove(InputTargetComponent.self)
+            photoEntity.components.remove(CollisionComponent.self)
             photoEntity.components.set(OpacityComponent(opacity: 0.0))
+            contentEntity.addChild(photoEntity)
 
             // Wait one render cycle for the component to set entity bounds, then scale to fit
             try? await Task.sleep(for: .milliseconds(50))
@@ -1881,8 +1906,10 @@ struct SpatialPhotoImmersiveView: View {
         let videoEntity = Entity()
         videoEntity.name = "videoEntity"
         videoEntity.components.set(videoComponent)
+        videoEntity.components.remove(HoverEffectComponent.self)
+        videoEntity.components.remove(InputTargetComponent.self)
+        videoEntity.components.remove(CollisionComponent.self)
         videoEntity.components.set(OpacityComponent(opacity: initialOpacity))
-        videoEntity.components.set(HoverEffectComponent())
 
         // Remove any previous scene-level video entity
         sceneVideoEntity?.removeFromParent()
@@ -2282,17 +2309,20 @@ struct SpatialPhotoImmersiveView: View {
     /// The window's pt dimensions map to meters at 1pt = 0.001m.
     private func windowFitScale(entityWidth: Float, entityHeight: Float) -> Float {
         guard entityWidth > 0 && entityHeight > 0 else { return 1.0 }
-        let maxW = Float(windowSize.width) * 0.001 * 0.8
-        let maxH = Float(windowSize.height - 120) * 0.001 * 0.8
+        let maxW = Float(windowSize.width) * 0.001 * 0.5
+        let maxH = Float(windowSize.height - 120) * 0.001 * 0.5
         return min(maxW / entityWidth, maxH / entityHeight)
     }
+
 
     // MARK: - Head Tracking
 
     private func getHeadBasedPosition() async -> SIMD3<Float> {
         // Push content behind the window plane. Extra depth keeps the spatialStereo
         // portal effect from visually overlapping the system movement bar at z=0.
-        return [0, 0, -0.20]
+        // Negative Y shifts the entity downward so it sits lower in the window,
+        // leaving breathing room at the top and aligning better with eye level.
+        return [0, -0.15, -0.20]
     }
 }
 

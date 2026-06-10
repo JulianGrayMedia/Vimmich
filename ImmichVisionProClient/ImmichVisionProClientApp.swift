@@ -89,6 +89,7 @@ struct ImmichVisionProClientApp: App {
                 .environmentObject(spatialPhotoManager)
                 .environmentObject(spatialCache)
                 .environmentObject(shareManager)
+                .persistentSystemOverlays(.hidden)
         }
         .windowStyle(.plain)
         .windowResizability(.contentMinSize)
