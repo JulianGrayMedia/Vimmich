@@ -146,8 +146,12 @@ struct Asset: Identifiable, Codable, Hashable {
             // Handle iso which might come as Int, Double, or String
             if let intValue = try? container.decodeIfPresent(Int.self, forKey: .iso) {
                 iso = intValue
-            } else if let doubleValue = try? container.decodeIfPresent(Double.self, forKey: .iso) {
-                iso = Int(doubleValue)
+            } else if let doubleValue = try? container.decodeIfPresent(Double.self, forKey: .iso),
+                      doubleValue.isFinite,
+                      let intValue = Int(exactly: doubleValue.rounded()) {
+                // Int(exactly:) returns nil for NaN, inf, and out-of-range values,
+                // avoiding the trap that Int(Double) hits on those inputs.
+                iso = intValue
             } else if let stringValue = try? container.decodeIfPresent(String.self, forKey: .iso),
                       let intValue = Int(stringValue) {
                 iso = intValue

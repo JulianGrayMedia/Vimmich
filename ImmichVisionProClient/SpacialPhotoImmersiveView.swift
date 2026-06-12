@@ -76,6 +76,15 @@ struct SpatialPhotoImmersiveView: View {
     // can decode frames before the user swipes to them.
     @State private var preloadEntity: Entity = Entity()
 
+    // Info panel attachment — rendered as a RealityKit attachment so it can sit at the
+    // same Z depth as the photo. SwiftUI overlays can't be pushed behind the window plane,
+    // so an attachment is the only way to put SwiftUI content at the photo's depth.
+    @State private var infoPanelAnchor: Entity? = nil
+    // Driven by a manual frame-stepped Task so the update closure sees intermediate
+    // values across the fade rather than a single boolean snap.
+    @State private var infoPanelOpacity: Float = 0.0
+    @State private var infoPanelFadeTask: Task<Void, Never>? = nil
+
 
     // Base position for RealityKit content (window center = [0,0,0])
     @State private var dynamicBasePosition: SIMD3<Float> = [0, 0, 0]
@@ -148,6 +157,15 @@ struct SpatialPhotoImmersiveView: View {
                 content.add(loadingAnchor)
             }
 
+            // Info panel attachment — added to scene at opacity 0 so it can be made visible
+            // by the update closure without requiring a re-add.
+            if let infoAnchor = attachments.entity(for: "infoPanel") {
+                infoAnchor.position = initialPosition
+                infoAnchor.components.set(OpacityComponent(opacity: 0.0))
+                content.add(infoAnchor)
+                await MainActor.run { infoPanelAnchor = infoAnchor }
+            }
+
             // Store the position for later use
             await MainActor.run {
                 dynamicBasePosition = initialPosition
@@ -167,10 +185,33 @@ struct SpatialPhotoImmersiveView: View {
             // Pre-create video entities for adjacent videos (runs after pre-buffering has time to complete)
             preCreateAdjacentVideoEntities()
 
-        } update: { _, _ in
+        } update: { _, attachments in
+            // Position the info panel at the right edge of the photo, same depth as the photo,
+            // slightly lower vertically. Visible only when showInfoPanel is true.
+            if let anchor = attachments.entity(for: "infoPanel") {
+                // Photo display width in meters (minWindowSize.width is in points; 1pt = 0.001m)
+                let photoHalfWidthM = Float(minWindowSize.width) * 0.001 * 0.5
+                let gap: Float = 0.05  // 5cm gap between photo right edge and panel left edge
+                let panelHalfWidthM: Float = 0.16  // approx — frame(width: 320) → 0.32m
+                let xOffset = photoHalfWidthM + gap + panelHalfWidthM
+                anchor.position = SIMD3<Float>(
+                    dynamicBasePosition.x + xOffset,
+                    dynamicBasePosition.y - 0.12,        // shift down a bit
+                    dynamicBasePosition.z + 0.025        // 25mm forward of the photo plane
+                )
+                anchor.components.set(OpacityComponent(opacity: infoPanelOpacity))
+            }
         } attachments: {
             Attachment(id: "loadingIndicator") {
                 LoadingPlaceholderView(isVisible: showLoading)
+            }
+            Attachment(id: "infoPanel") {
+                InfoPanelWrapper(spatialPhotoManager: spatialPhotoManager)
+                    .frame(width: 320)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 18)
+                    .glassBackgroundEffect()
+                    .allowsHitTesting(showControls && showInfoPanel)
             }
         }
         .ornament(attachmentAnchor: .scene(.bottom)) {
@@ -341,6 +382,16 @@ struct SpatialPhotoImmersiveView: View {
                     toggleControls()
                 }
         )
+        .onChange(of: showInfoPanel) { _, newValue in
+            // Animate the panel's opacity so it fades in/out instead of snapping.
+            // withAnimation can't drive a side-effect update closure, so step through
+            // frames manually — each opacity change triggers a body re-eval which fires
+            // the RealityView update closure with the new value.
+            infoPanelFadeTask?.cancel()
+            infoPanelFadeTask = Task { @MainActor in
+                await fadeInfoPanel(to: newValue ? 1.0 : 0.0, duration: 0.28)
+            }
+        }
         .onChange(of: spatialPhotoManager.currentIndex) { oldValue, newValue in
             // Handle external navigation (from buttons)
             // Skip if already displaying to avoid race condition with initial load
@@ -1963,6 +2014,30 @@ struct SpatialPhotoImmersiveView: View {
         }
     }
 
+    /// Manually animate infoPanelOpacity across the duration, easing in/out.
+    /// Each opacity write triggers a body re-eval, which re-runs the RealityView's
+    /// update closure with the interpolated opacity value.
+    private func fadeInfoPanel(to target: Float, duration: TimeInterval) async {
+        let startOpacity = infoPanelOpacity
+        guard startOpacity != target else { return }
+        let frameCount = 18  // ~64fps for a 0.28s fade
+        let stepNanos = UInt64(duration * 1_000_000_000 / Double(frameCount))
+
+        for i in 1...frameCount {
+            if Task.isCancelled { return }
+            let t = Float(i) / Float(frameCount)
+            // easeInOut cubic
+            let eased: Float = t < 0.5
+                ? 4 * t * t * t
+                : 1 - pow(-2 * t + 2, 3) / 2
+            infoPanelOpacity = startOpacity + (target - startOpacity) * eased
+            try? await Task.sleep(nanoseconds: stepNanos)
+        }
+        if !Task.isCancelled {
+            infoPanelOpacity = target
+        }
+    }
+
     private func showControlsTemporarily() {
         // Cancel any pending hide task
         hideControlsTask?.cancel()
@@ -2560,11 +2635,12 @@ struct AssetInfoPanelView: View {
     /// Build camera settings string from EXIF data
     private func cameraSettingsString(from exif: Asset.ExifInfo) -> String? {
         var settings: [String] = []
-        if let f = exif.fNumber {
+        if let f = exif.fNumber, f.isFinite {
             settings.append("ƒ/\(String(format: "%.1f", f))")
         }
-        if let focal = exif.focalLength {
-            settings.append("\(Int(focal))mm")
+        if let focal = exif.focalLength, focal.isFinite {
+            // %.0f avoids the Int(Double) trap on NaN/inf/out-of-range values.
+            settings.append(String(format: "%.0fmm", focal))
         }
         if let iso = exif.iso {
             settings.append("ISO \(iso)")
@@ -2689,34 +2765,24 @@ struct ControlsContentView: View {
     let formatBytes: (Int64) -> String
 
     var body: some View {
-        VStack(spacing: 12) {
-            // Info panel (only rendered when visible)
-            if showInfoPanel {
-                InfoPanelWrapper(spatialPhotoManager: spatialPhotoManager)
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 16)
-                    .glassBackgroundEffect()
-                    .transition(.opacity.combined(with: .move(edge: .bottom)))
-            }
-
-            // Main controls bar
-            mainControlsBar
-                .padding(.horizontal, 12)
-                .padding(.vertical, 12)
-                .glassBackgroundEffect(in: Capsule())
-        }
-        .animation(.easeOut(duration: 0.2), value: showInfoPanel)
-        .opacity(showControls ? 1 : 0)
-        .animation(.easeInOut(duration: 0.25), value: showControls)
-        .allowsHitTesting(showControls)
-        .onChange(of: showInfoPanel) { oldValue, newValue in
-            print("ℹ️ showInfoPanel changed: \(oldValue) -> \(newValue)")
-            if newValue {
-                Task {
-                    await spatialPhotoManager.fetchCurrentAssetDetails()
+        // The info panel was lifted out of this VStack and now renders as a floating
+        // overlay in front of the RealityView (see SpatialPhotoImmersiveView.body) so
+        // opening it doesn't displace the video timeline or controls bar.
+        mainControlsBar
+            .padding(.horizontal, 12)
+            .padding(.vertical, 12)
+            .glassBackgroundEffect(in: Capsule())
+            .opacity(showControls ? 1 : 0)
+            .animation(.easeInOut(duration: 0.25), value: showControls)
+            .allowsHitTesting(showControls)
+            .onChange(of: showInfoPanel) { oldValue, newValue in
+                print("ℹ️ showInfoPanel changed: \(oldValue) -> \(newValue)")
+                if newValue {
+                    Task {
+                        await spatialPhotoManager.fetchCurrentAssetDetails()
+                    }
                 }
             }
-        }
     }
 
     private var mainControlsBar: some View {
